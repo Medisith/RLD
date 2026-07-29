@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace App\LimitacaoRequisicoes\Excecoes;
+namespace App\RateLimiting\Exceptions;
 
 use RuntimeException;
 
@@ -13,6 +13,6 @@ use RuntimeException;
  * no limitador, permitindo que camadas superiores tratem "qualquer erro de
  * limitação" sem capturar RuntimeException genérica.
  */
-abstract class ExcecaoLimitacao extends RuntimeException
+abstract class RateLimitException extends RuntimeException
 {
 }

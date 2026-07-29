@@ -43,7 +43,7 @@ return [
         'options' => [
             'cluster' => env('REDIS_CLUSTER', 'redis'),
             // Prefixo vazio de propósito: a chave de limitação é montada por
-            // inteiro pelo ResolvedorChaveLimitacao (padrão documentado no
+            // inteiro pelo RateLimitKeyResolver (padrão documentado no
             // ADR), sem prefixo implícito do framework escondendo parte dela.
             'prefix' => env('REDIS_PREFIX', ''),
         ],

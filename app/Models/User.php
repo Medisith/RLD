@@ -12,7 +12,7 @@ use Illuminate\Notifications\Notifiable;
  *
  * Responsabilidade: existir para o guard de autenticação padrão. Nas
  * Fases 0 e 1 a rota de teste é pública e a estratégia de chave
- * "usuario_ou_ip" cai para o IP quando não há usuário autenticado.
+ * "user_or_ip" cai para o IP quando não há usuário autenticado.
  */
 class User extends Authenticatable
 {

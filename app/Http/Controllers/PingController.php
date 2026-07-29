@@ -7,10 +7,10 @@ namespace App\Http\Controllers;
 use Illuminate\Http\JsonResponse;
 
 /**
- * Controller da rota de teste do limitador (POST /api/limitado/ping).
+ * Controller da rota de teste do limitador (POST /api/rate-limited/ping).
  *
  * Responsabilidade: nenhuma regra de negócio — existe apenas para provar
- * que a requisição atravessou o MiddlewareLimitacaoAvancada e chegou à
+ * que a requisição atravessou o AdvancedRateLimiterMiddleware e chegou à
  * camada de aplicação. Controller de ação única, propositalmente fino.
  */
 class PingController extends Controller
@@ -23,8 +23,8 @@ class PingController extends Controller
     public function __invoke(): JsonResponse
     {
         return new JsonResponse([
-            'mensagem' => 'pong',
-            'horario_servidor' => now()->toIso8601String(),
+            'message' => 'pong',
+            'server_time' => now()->toIso8601String(),
         ]);
     }
 }
