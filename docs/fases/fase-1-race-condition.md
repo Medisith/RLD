@@ -1,20 +1,20 @@
 # Fase 1 — Limitador ingênuo e prova empírica da race condition
 
 Objetivo da fase: implementar o limitador **errado de propósito** (check-then-act em comandos
-Redis separados), colocá-lo atrás do contrato definitivo `AlgoritmoLimitacao` e **provar com
+Redis separados), colocá-lo atrás do contrato definitivo `RateLimitAlgorithm` e **provar com
 números reais** que ele admite mais requisições do que a capacidade permite. Esta implementação
 existe para falhar. Ela será substituída pelo Token Bucket atômico via script Lua em fase futura,
 sem alterar middleware, config ou rotas.
 
 ## O que foi implementado
 
-- `LimitadorIngenuoRedis`: contador em janela fixa com o ciclo `GET` → decisão no PHP →
+- `NaiveRedisRateLimiter`: contador em janela fixa com o ciclo `GET` → decisão no PHP →
   `SET`/`INCRBY` (comandos separados). Cada ponto vulnerável está comentado no próprio código.
-- `MiddlewareLimitacaoAvancada`: resolve política e chave, consulta o algoritmo; negado → 429 JSON
-  com mensagens em português + `X-RateLimit-Limit`, `X-RateLimit-Remaining` e `Retry-After`;
+- `AdvancedRateLimiterMiddleware`: resolve política e chave, consulta o algoritmo; negado → 429 JSON
+  com corpo JSON + `X-RateLimit-Limit`, `X-RateLimit-Remaining` e `Retry-After`;
   permitido → segue o pipeline e anexa os headers informativos.
-- Política de teste: capacidade 50, janela/TTL 60 s, custo 1 (rota `limitado.ping`).
-- `scripts/provar_race_condition.php`: prova empírica em dois modos (algoritmo e http).
+- Política de teste: capacidade 50, janela/TTL 60 s, custo 1 (rota `rate-limited.ping`).
+- `scripts/prove_race_condition.php`: prova empírica em dois modos (`algorithm` e `http`).
 
 ## Por que check-then-act falha
 
@@ -42,8 +42,8 @@ final no Redis é **menor** que o total de requisições realmente admitidas.
 ## Como reproduzir
 
 Pré-requisito: Redis acessível (padrão `127.0.0.1:6379`) e PHP com as extensões `redis` e
-`pcntl`. O modo algoritmo **não** exige `composer install` nem a aplicação de pé — ele carrega o
-mesmo `LimitadorIngenuoRedis` do middleware por um autoloader mínimo.
+`pcntl`. O algorithm mode **não** exige `composer install` nem a aplicação de pé — ele carrega o
+mesmo `NaiveRedisRateLimiter` do middleware por um autoloader mínimo.
 
 ```bash
 # subir um Redis local descartável
@@ -51,19 +51,19 @@ redis-server --daemonize yes --port 6379 --save '' --appendonly no
 
 # prova direta no algoritmo: 40 processos x 5 tentativas = 200 tentativas
 # concorrentes contra capacidade 50, 3 rodadas
-php scripts/provar_race_condition.php --processos=40 --tentativas=5 --rodadas=3
+php scripts/prove_race_condition.php --processes=40 --attempts=5 --rounds=3
 ```
 
 Variante fim a fim via HTTP (exige `composer install` e a aplicação servida):
 
 ```bash
 php artisan serve --port=8000
-php scripts/provar_race_condition.php --modo=http \
-    --url=http://localhost:8000/api/limitado/ping --rodadas=1
+php scripts/prove_race_condition.php --mode=http \
+    --url=http://localhost:8000/api/rate-limited/ping --rounds=1
 ```
 
 No modo http, entre rodadas o script aguarda a janela expirar (ou limpe a chave manualmente com
-`redis-cli DEL "limitacao:ip:127.0.0.1:limitado.ping"`).
+`redis-cli DEL "rate-limit:ip:127.0.0.1:rate-limited.ping"`).
 
 ## Resultado obtido (execução real)
 
@@ -72,19 +72,19 @@ mesma máquina (latência mínima — cenário **conservador**: com latência de
 corrida cresce e o excesso tende a piorar). Comando executado:
 
 ```bash
-php scripts/provar_race_condition.php --processos=40 --tentativas=5 --rodadas=3
+php scripts/prove_race_condition.php --processes=40 --attempts=5 --rounds=3
 ```
 
-Saída relevante (números reais, não simulados):
+Saída relevante (números reais, não simulados — formato da época da medição; CLI atual usa inglês):
 
 ```
-modo=algoritmo | processos=40 | tentativas/processo=5 | total de tentativas=200
-política: capacidade=50, janela=60s, custo=1
-permitidos esperados por rodada (o correto): 50
+mode=algorithm | processes=40 | attempts/process=5 | total attempts=200
+policy: capacity=50, window=60s, cost=1
+expected allowed per round (correct): 50
 
-rodada 1: esperados=50, obtidos=86, contador final no Redis=64
-rodada 2: esperados=50, obtidos=89, contador final no Redis=68
-rodada 3: esperados=50, obtidos=90, contador final no Redis=72
+round 1: expected=50, obtained=86, final Redis counter=64
+round 2: expected=50, obtained=89, final Redis counter=68
+round 3: expected=50, obtained=90, final Redis counter=72
 ```
 
 | Rodada | Permitidos esperados | Permitidos obtidos | Excesso admitido |
@@ -106,18 +106,18 @@ Leitura dos números, sintoma a sintoma:
 
 Observação metodológica: concorrência é probabilística; os números variam por execução e por
 máquina. O que é estável é o fenômeno — obtidos > esperados sempre que há concorrência real na
-borda da capacidade. Se uma execução não exibir excesso, aumente `--processos`/`--tentativas`.
+borda da capacidade. Se uma execução não exibir excesso, aumente `--processes`/`--attempts`.
 
 ## Aviso e próximo passo
 
-`LimitadorIngenuoRedis` está rotulado no código com aviso de projeto e **não deve ser usado em
+`NaiveRedisRateLimiter` está rotulado no código com aviso de projeto e **não deve ser usado em
 produção**. A correção definitiva — mover leitura+decisão+escrita para dentro de um script Lua
 executado atomicamente no Redis (Token Bucket) — é escopo da próxima fase e substituirá o
 algoritmo atrás do mesmo contrato, sem tocar no middleware.
 
 ## Testes automatizados desta fase
 
-`tests/Feature/LimitacaoRequisicoes/MiddlewareLimitacaoAvancadaTest.php` cobre o comportamento
+`tests/Feature/RateLimiting/AdvancedRateLimiterMiddlewareTest.php` cobre o comportamento
 **sequencial**: abaixo do limite responde 200 com headers corretos; estourada a capacidade,
 responde 429 com corpo e headers do contrato. Importante e explícito no próprio teste: **teste
 sequencial não prova nem refuta a race condition** — uma requisição por vez nunca abre a janela de

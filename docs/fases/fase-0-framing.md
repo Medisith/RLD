@@ -11,34 +11,34 @@ Fase 1 em diante.
 Toda contagem é indexada por uma chave canônica no Redis:
 
 ```
-limitacao:{estrategia}:{identificador}:{nomeRota}
+rate-limit:{strategy}:{identifier}:{routeName}
 ```
 
-- `estrategia`: `usuario` (id do usuário autenticado), `ip` (endereço de origem) ou
-  `usuario_ou_ip` (usuário quando autenticado, senão IP). Na chave gravada, `usuario_ou_ip`
-  registra a estratégia que **prevaleceu** (`usuario` ou `ip`), nunca o literal `usuario_ou_ip`.
-- `identificador`: id do usuário, IP, ou `anonimo` (política `usuario` sem autenticação — balde
+- `strategy`: `user` (id do usuário autenticado), `ip` (endereço de origem) ou
+  `user_or_ip` (usuário quando autenticado, senão IP). Na chave gravada, `user_or_ip`
+  registra a estratégia que **prevaleceu** (`user` ou `ip`), nunca o literal `user_or_ip`.
+- `identifier`: id do usuário, IP, ou `anonymous` (política `user` sem autenticação — balde
   único explícito, preferível a erro silencioso).
-- `nomeRota`: nome da rota Laravel (ex.: `limitado.ping`), que também indexa a política em
-  `config/limitacao_requisicoes.php`.
+- `routeName`: nome da rota Laravel (ex.: `rate-limited.ping`), que também indexa a política em
+  `config/rate_limiting.php`.
 
-Exemplo real: `limitacao:ip:203.0.113.10:limitado.ping`.
+Exemplo real: `rate-limit:ip:203.0.113.10:rate-limited.ping`.
 
 ### Limite exemplo (política da rota de teste)
 
-`POST /api/limitado/ping`: capacidade **50** consumos por janela de **60 segundos**, custo **1**
-por requisição, estratégia `usuario_ou_ip`, algoritmo `ingenuo` (Fase 1).
+`POST /api/rate-limited/ping`: capacidade **50** consumos por janela de **60 segundos**, custo **1**
+por requisição, estratégia `user_or_ip`, algoritmo `naive` (Fase 1).
 
 ### Resposta quando o limite é excedido
 
-Status **429 Too Many Requests**, corpo JSON com mensagens de negócio em português:
+Status **429 Too Many Requests**, corpo JSON em inglês (código/API); comentários do projeto em português:
 
 ```json
 {
-    "mensagem": "Limite de requisições excedido. Tente novamente em 42 segundos.",
-    "codigo": "LIMITE_REQUISICOES_EXCEDIDO",
-    "limite": 50,
-    "tentar_novamente_em": 42
+    "message": "Rate limit exceeded. Try again in 42 seconds.",
+    "code": "RATE_LIMIT_EXCEEDED",
+    "limit": 50,
+    "retry_after": 42
 }
 ```
 
@@ -48,64 +48,45 @@ Status **429 Too Many Requests**, corpo JSON com mensagens de negócio em portug
 |---|---|---|
 | `X-RateLimit-Limit` | 200 e 429 | Capacidade total da política na janela |
 | `X-RateLimit-Remaining` | 200 e 429 | Consumos restantes após esta decisão (0 quando negado) |
-| `Retry-After` | somente 429 | Segundos até valer a pena tentar de novo (mínimo 1) |
+| `Retry-After` | 429 | Segundos até valer a pena tentar de novo |
 
-Reservado para fase futura: `X-RateLimit-Reset` (instante de renovação da janela).
+### Política de falha (documentada, ainda não implementada)
 
-## Política de falha (fail-open / fail-closed) — apenas documentada
+`failure_mode` existe na config desde já, com dois valores possíveis:
 
-`modo_falha` existe na config desde já, com dois valores possíveis:
+- `open` — se o Redis cair, deixa a requisição passar (prioriza disponibilidade)
+- `closed` — se o Redis cair, nega com 503 (prioriza proteção do backend)
 
-- `aberto` (fail-open): Redis indisponível → a requisição **passa** sem contagem. Prioriza
-  disponibilidade do produto; aceita perder proteção durante o incidente.
-- `fechado` (fail-closed): Redis indisponível → resposta **503**. Prioriza proteção do backend;
-  aceita negar tráfego legítimo durante o incidente.
-
-**Estado nas Fases 0 e 1:** nenhum dos dois modos é honrado. Falha de Redis lança
-`ExcecaoRedisIndisponivel`, que propaga e derruba a requisição de forma explícita e visível.
-Decisão consciente: implementar fail-open/fail-closed antes de ter o algoritmo correto mascararia
-erros de infraestrutura justamente na fase cujo objetivo é expor comportamento incorreto.
+Nas Fases 0 e 1 a falha de Redis **propaga** (`RedisUnavailableException`). O middleware ainda
+**não** honra `failure_mode`; isso é fase futura.
 
 ## Contratos de código (fechados nesta fase)
 
-- `AlgoritmoLimitacao::tentar(string $chave, PoliticaLimitacao $politica, int $custo): ResultadoLimitacao`
-- `ResolvedorChaveLimitacao::resolver(Request $request, PoliticaLimitacao $politica): string`
-- `ClienteRedisLimitacao` — porta de acesso ao Redis restrita a comandos individuais (GET, SET,
-  INCRBY, TTL, EXPIRE, DEL). A ausência de operações compostas é proposital: é o que torna o
-  algoritmo da Fase 1 estruturalmente incapaz de ser atômico.
-- DTOs imutáveis (`readonly`): `PoliticaLimitacao` (valida invariantes na construção) e
-  `ResultadoLimitacao` (`permitido`, `restante`, `limite`, `tentarNovamenteEm`, `algoritmo`,
-  `chave`).
-- Wiring: alias de middleware `limitacao.avancada` → `MiddlewareLimitacaoAvancada` (declarado em
-  `bootstrap/app.php`); bindings em `LimitacaoRequisicoesServiceProvider`.
+- `RateLimitAlgorithm::attempt(string $key, RateLimitPolicy $policy, int $cost): RateLimitResult`
+- `RateLimitKeyResolver::resolve(Request $request, RateLimitPolicy $policy): string`
+- `RateLimitRedisClient` — apenas comandos individuais (`get`, `setWithTtl`, `increment`, `ttl`,
+  `expire`, `delete`); sem EVAL/Lua nesta fase
+- DTOs: `RateLimitPolicy`, `RateLimitResult`
+- Enums: `KeyStrategy`, `AvailableAlgorithm` (somente `Naive` nas Fases 0 e 1)
+- Middleware alias: `rate-limit.advanced`
+- Config: `config/rate_limiting.php`
 
-## Critérios de aceite da Fase 0
+## Critério de pronto da Fase 0
 
-1. ADR 001 e este documento escritos e honestos sobre o que está incompleto.
-2. `config/limitacao_requisicoes.php` com chaves em português e políticas por rota.
-3. Contratos, DTOs e wiring completos; `POST /api/limitado/ping` atravessa o middleware e chega ao
-   `PingController`.
-4. Zero uso do rate limiter nativo do Laravel (`throttle`, `ThrottleRequests`, facade
-   `RateLimiter`) em qualquer arquivo do projeto.
+1. ADR 001 e este documento
+2. Config tipada e políticas por rota
+3. Contratos, DTOs e wiring completos; `POST /api/rate-limited/ping` atravessa o middleware e chega ao
+   controller (decisão de limite é Fase 1)
+4. Zero uso do rate limiter nativo do Laravel
 
 ## Glossário
 
-- **Limitador de requisições (rate limiter):** mecanismo que restringe quantas requisições um
-  cliente pode fazer num intervalo.
-- **Chave de limitação:** string canônica que identifica "quem × qual rota" e indexa o contador no
-  Redis.
 - **Política de limitação:** conjunto validado de parâmetros (capacidade, janela, custo,
   estratégia, algoritmo) aplicado a uma rota.
-- **Capacidade:** total de consumos permitidos dentro de uma janela.
-- **Janela fixa:** intervalo de duração constante (aqui, o TTL da chave) dentro do qual a
-  capacidade vale; ao expirar, o saldo renasce inteiro.
+- **Chave de limitação:** identificador Redis que agrupa o saldo de um cliente em uma rota.
+- **Janela fixa:** intervalo de tempo com TTL no Redis; dentro dela o contador sobe até a
+  capacidade; ao expirar, o saldo renasce inteiro.
 - **Custo:** quantas unidades de capacidade uma requisição consome (padrão 1).
-- **Check-then-act:** padrão "ler, decidir, escrever" em passos separados; sob concorrência, a
-  decisão usa leitura obsoleta — é o defeito estudado na Fase 1.
-- **Race condition (condição de corrida):** resultado incorreto que depende da intercalação
-  temporal de processos concorrentes.
-- **Atomicidade:** propriedade de uma operação executar como um todo indivisível, sem estado
-  intermediário observável por terceiros.
-- **Fail-open / fail-closed (modo_falha aberto/fechado):** o que fazer quando a infraestrutura de
-  decisão está fora — deixar passar ou negar.
-- **429 Too Many Requests:** status HTTP padrão para limite excedido.
+- **Check-then-act:** ler, decidir no PHP e escrever em comandos separados (vulnerável a race).
+- **Fail-open / fail-closed (`failure_mode` open/closed):** o que fazer quando a infraestrutura de
+  contagem falha.

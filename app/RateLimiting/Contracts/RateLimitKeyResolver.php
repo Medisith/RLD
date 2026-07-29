@@ -2,9 +2,9 @@
 
 declare(strict_types=1);
 
-namespace App\LimitacaoRequisicoes\Contratos;
+namespace App\RateLimiting\Contracts;
 
-use App\LimitacaoRequisicoes\Suporte\PoliticaLimitacao;
+use App\RateLimiting\Support\RateLimitPolicy;
 use Illuminate\Http\Request;
 
 /**
@@ -14,14 +14,14 @@ use Illuminate\Http\Request;
  * de contagem no Redis. Isolado em contrato para permitir estratégias
  * futuras (por API key, por tenant) sem tocar no middleware.
  */
-interface ResolvedorChaveLimitacao
+interface RateLimitKeyResolver
 {
     /**
      * Recebe: a requisição HTTP corrente e a política vigente. Faz: aplica a
-     * estratégia da política (usuario | ip | usuario_ou_ip) para identificar
+     * estratégia da política (user | ip | user_or_ip) para identificar
      * o cliente e monta a chave no padrão
-     * limitacao:{estrategia}:{identificador}:{nomeRota}. Retorna: a chave
+     * rate-limit:{strategy}:{identifier}:{routeName}. Retorna: a chave
      * resolvida. Efeitos colaterais: nenhum (não toca no Redis).
      */
-    public function resolver(Request $request, PoliticaLimitacao $politica): string;
+    public function resolve(Request $request, RateLimitPolicy $policy): string;
 }
