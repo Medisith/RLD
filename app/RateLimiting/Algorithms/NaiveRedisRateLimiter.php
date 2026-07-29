@@ -2,13 +2,13 @@
 
 declare(strict_types=1);
 
-namespace App\LimitacaoRequisicoes\Algoritmos;
+namespace App\RateLimiting\Algorithms;
 
-use App\LimitacaoRequisicoes\Contratos\AlgoritmoLimitacao;
-use App\LimitacaoRequisicoes\Contratos\ClienteRedisLimitacao;
-use App\LimitacaoRequisicoes\Excecoes\ExcecaoPoliticaInvalida;
-use App\LimitacaoRequisicoes\Suporte\PoliticaLimitacao;
-use App\LimitacaoRequisicoes\Suporte\ResultadoLimitacao;
+use App\RateLimiting\Contracts\RateLimitAlgorithm;
+use App\RateLimiting\Contracts\RateLimitRedisClient;
+use App\RateLimiting\Exceptions\InvalidRateLimitPolicyException;
+use App\RateLimiting\Support\RateLimitPolicy;
+use App\RateLimiting\Support\RateLimitResult;
 
 /**
  * Limitador ingênuo por contador em janela fixa — check-then-act SEM
@@ -18,10 +18,10 @@ use App\LimitacaoRequisicoes\Suporte\ResultadoLimitacao;
  * ESTA CLASSE É PROPOSITALMENTE INCORRETA SOB CONCORRÊNCIA. Ela existe para
  * a Fase 1 do exercício: demonstrar, com números reais, por que "ler no
  * Redis, decidir no PHP e escrever no Redis" NÃO funciona como rate limiter
- * distribuído. A prova empírica está em scripts/provar_race_condition.php e
+ * distribuído. A prova empírica está em scripts/prove_race_condition.php e
  * os resultados em docs/fases/fase-1-race-condition.md. A versão correta
  * (Token Bucket atômico via script Lua) virá em fase futura e substituirá
- * esta implementação atrás do MESMO contrato AlgoritmoLimitacao.
+ * esta implementação atrás do MESMO contrato RateLimitAlgorithm.
  * NÃO USE ESTA CLASSE EM PRODUÇÃO.
  * ==========================================================================
  *
@@ -29,39 +29,39 @@ use App\LimitacaoRequisicoes\Suporte\ResultadoLimitacao;
  * janela da política, decidindo permitir/negar pela comparação
  * contador + custo <= capacidade.
  */
-final readonly class LimitadorIngenuoRedis implements AlgoritmoLimitacao
+final readonly class NaiveRedisRateLimiter implements RateLimitAlgorithm
 {
     /**
      * Recebe: a porta de acesso ao Redis (somente comandos individuais —
-     * ver ClienteRedisLimitacao). Faz: guarda a dependência. Retorna:
+     * ver RateLimitRedisClient). Faz: guarda a dependência. Retorna:
      * instância imutável. Efeitos colaterais: nenhum.
      */
     public function __construct(
-        private ClienteRedisLimitacao $clienteRedis,
+        private RateLimitRedisClient $redisClient,
     ) {
     }
 
     /**
      * Recebe: chave resolvida, política vigente e custo da requisição.
      * Faz: executa o ciclo check-then-act descrito abaixo. Retorna:
-     * ResultadoLimitacao com o veredito. Efeitos colaterais: lê e escreve o
+     * RateLimitResult com o veredito. Efeitos colaterais: lê e escreve o
      * contador no Redis em COMANDOS SEPARADOS (esta é a falha estudada);
-     * lança ExcecaoPoliticaInvalida para custo < 1 e propaga
-     * ExcecaoRedisIndisponivel da infraestrutura.
+     * lança InvalidRateLimitPolicyException para custo < 1 e propaga
+     * RedisUnavailableException da infraestrutura.
      */
-    public function tentar(string $chave, PoliticaLimitacao $politica, int $custo): ResultadoLimitacao
+    public function attempt(string $key, RateLimitPolicy $policy, int $cost): RateLimitResult
     {
-        if ($custo < 1) {
-            throw ExcecaoPoliticaInvalida::porMotivo(
-                "custo deve ser >= 1 (recebido: {$custo}) ao consumir a chave '{$chave}'"
+        if ($cost < 1) {
+            throw InvalidRateLimitPolicyException::forReason(
+                "cost must be >= 1 (received: {$cost}) while consuming key '{$key}'"
             );
         }
 
         // ------------------------------------------------------------------
         // PASSO 1 — CHECK: leitura do contador (comando GET isolado).
         // ------------------------------------------------------------------
-        $valorBruto = $this->clienteRedis->obterValor($chave);
-        $quantidadeConsumida = $valorBruto === null ? 0 : (int) $valorBruto;
+        $rawValue = $this->redisClient->get($key);
+        $consumed = $rawValue === null ? 0 : (int) $rawValue;
 
         // ------------------------------------------------------------------
         // PASSO 2 — DECISÃO: tomada AQUI, no PHP, sobre um valor que já pode
@@ -77,59 +77,59 @@ final readonly class LimitadorIngenuoRedis implements AlgoritmoLimitacao
         // leitura+decisão+escrita virem UMA operação atômica no servidor
         // (script Lua — fase futura).
         // ------------------------------------------------------------------
-        if ($quantidadeConsumida + $custo > $politica->capacidade) {
+        if ($consumed + $cost > $policy->capacity) {
             // Mais um comando separado (TTL): o valor pode mudar entre a
             // decisão e esta leitura — aceitável apenas porque é informativo
             // (Retry-After), não decisório.
-            $ttlRestante = $this->clienteRedis->tempoRestanteTtl($chave);
+            $remainingTtl = $this->redisClient->ttl($key);
 
-            return ResultadoLimitacao::negado(
-                politica: $politica,
-                chave: $chave,
+            return RateLimitResult::denied(
+                policy: $policy,
+                key: $key,
                 // TTL -2 (chave expirou entre os comandos) ou -1 (sem TTL,
                 // fruto de outra corrida documentada abaixo): instrui a
                 // janela cheia por honestidade conservadora.
-                tentarNovamenteEm: $ttlRestante > 0 ? $ttlRestante : $politica->janelaSegundos,
+                retryAfter: $remainingTtl > 0 ? $remainingTtl : $policy->windowSeconds,
             );
         }
 
         // ------------------------------------------------------------------
         // PASSO 3 — ACT: escrita em comando separado do GET (o "buraco").
         // ------------------------------------------------------------------
-        if ($valorBruto === null) {
+        if ($rawValue === null) {
             // Primeira requisição da janela (segundo este processo): SET com
             // TTL. >>> VULNERÁVEL <<< Se dois processos entram aqui ao mesmo
             // tempo, o segundo SET SOBRESCREVE o contador do primeiro
             // (consumo perdido) e reinicia o TTL (janela alongada). Ambos são
             // admitidos como se fossem "o primeiro".
-            $this->clienteRedis->definirValorComTtl(
-                chave: $chave,
-                valor: $custo,
-                ttlSegundos: $politica->janelaSegundos,
+            $this->redisClient->setWithTtl(
+                key: $key,
+                value: $cost,
+                ttlSeconds: $policy->windowSeconds,
             );
 
-            $quantidadeAposConsumo = $custo;
+            $consumedAfter = $cost;
         } else {
             // Chave já existia: INCRBY. O incremento em si é atômico no
             // Redis, mas a DECISÃO que o autorizou foi tomada sobre leitura
             // velha — o contador pode ultrapassar a capacidade neste exato
             // comando (é o excesso que a prova da Fase 1 mede).
-            $quantidadeAposConsumo = $this->clienteRedis->incrementar($chave, $custo);
+            $consumedAfter = $this->redisClient->increment($key, $cost);
 
             // Reparo de TTL órfão: se a chave expirou entre o GET e o INCRBY,
             // o INCRBY a recriou SEM TTL (contador eterno). O EXPIRE abaixo
             // remenda — em MAIS um comando separado, ele próprio sujeito a
             // corrida. A necessidade deste remendo é sintoma do desenho
             // errado, não solução.
-            if ($this->clienteRedis->tempoRestanteTtl($chave) < 0) {
-                $this->clienteRedis->expirarEm($chave, $politica->janelaSegundos);
+            if ($this->redisClient->ttl($key) < 0) {
+                $this->redisClient->expire($key, $policy->windowSeconds);
             }
         }
 
-        return ResultadoLimitacao::permitido(
-            politica: $politica,
-            chave: $chave,
-            restante: $politica->capacidade - $quantidadeAposConsumo,
+        return RateLimitResult::allowed(
+            policy: $policy,
+            key: $key,
+            remaining: $policy->capacity - $consumedAfter,
         );
     }
 }
