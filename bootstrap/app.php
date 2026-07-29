@@ -7,11 +7,11 @@ declare(strict_types=1);
  *
  * Responsabilidade: montar a aplicação (rotas, middleware, exceções) sem
  * nenhum uso do rate limiter nativo do framework. O alias de middleware
- * "limitacao.avancada" aponta para a classe de domínio
- * App\LimitacaoRequisicoes\Http\MiddlewareLimitacaoAvancada.
+ * "rate-limit.advanced" aponta para a classe de domínio
+ * App\RateLimiting\Http\AdvancedRateLimiterMiddleware.
  */
 
-use App\LimitacaoRequisicoes\Http\MiddlewareLimitacaoAvancada;
+use App\RateLimiting\Http\AdvancedRateLimiterMiddleware;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
@@ -27,7 +27,7 @@ return Application::configure(basePath: dirname(__DIR__))
         // Alias único do exercício: nenhuma referência a "throttle" ou ao
         // ThrottleRequests nativo em nenhum ponto do projeto.
         $middleware->alias([
-            'limitacao.avancada' => MiddlewareLimitacaoAvancada::class,
+            'rate-limit.advanced' => AdvancedRateLimiterMiddleware::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {

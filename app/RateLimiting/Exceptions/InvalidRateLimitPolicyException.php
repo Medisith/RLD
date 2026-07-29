@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace App\LimitacaoRequisicoes\Excecoes;
+namespace App\RateLimiting\Exceptions;
 
 /**
  * Lançada quando uma política de limitação viola invariantes de negócio ou
@@ -12,15 +12,15 @@ namespace App\LimitacaoRequisicoes\Excecoes;
  * imediata (na construção da política), em vez de comportamento silencioso
  * errado em produção.
  */
-final class ExcecaoPoliticaInvalida extends ExcecaoLimitacao
+final class InvalidRateLimitPolicyException extends RateLimitException
 {
     /**
-     * Recebe: motivo humano-legível em português. Faz: monta a exceção com
-     * mensagem padronizada. Retorna: instância pronta para lançar. Efeitos
+     * Recebe: motivo humano-legível. Faz: monta a exceção com mensagem
+     * padronizada. Retorna: instância pronta para lançar. Efeitos
      * colaterais: nenhum.
      */
-    public static function porMotivo(string $motivo): self
+    public static function forReason(string $reason): self
     {
-        return new self("Política de limitação inválida: {$motivo}.");
+        return new self("Invalid rate limit policy: {$reason}.");
     }
 }

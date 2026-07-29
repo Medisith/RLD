@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace App\LimitacaoRequisicoes\Suporte;
+namespace App\RateLimiting\Support;
 
 /**
  * DTO imutável com o veredito de uma tentativa de consumo.
@@ -11,7 +11,7 @@ namespace App\LimitacaoRequisicoes\Suporte;
  * camada HTTP precisa para responder (permitir/negar, headers de limite e
  * instrução de retry), sem que o middleware conheça detalhes do algoritmo.
  */
-final readonly class ResultadoLimitacao
+final readonly class RateLimitResult
 {
     /**
      * Recebe: veredito e contadores já calculados pelo algoritmo. Faz:
@@ -20,18 +20,18 @@ final readonly class ResultadoLimitacao
      */
     public function __construct(
         // true se a requisição pode prosseguir.
-        public bool $permitido,
+        public bool $allowed,
         // Consumos ainda disponíveis na janela APÓS esta decisão (>= 0).
-        public int $restante,
+        public int $remaining,
         // Capacidade total da política (espelhado em X-RateLimit-Limit).
-        public int $limite,
+        public int $limit,
         // Segundos até valer a pena tentar de novo (Retry-After quando negado;
         // 0 quando permitido).
-        public int $tentarNovamenteEm,
+        public int $retryAfter,
         // Valor string do algoritmo que decidiu (rastreabilidade em log).
-        public string $algoritmo,
+        public string $algorithm,
         // Chave de limitação completa usada na decisão.
-        public string $chave,
+        public string $key,
     ) {
     }
 
@@ -40,41 +40,41 @@ final readonly class ResultadoLimitacao
      * monta veredito de permissão com contadores saneados. Retorna:
      * resultado permitido. Efeitos colaterais: nenhum.
      */
-    public static function permitido(
-        PoliticaLimitacao $politica,
-        string $chave,
-        int $restante,
+    public static function allowed(
+        RateLimitPolicy $policy,
+        string $key,
+        int $remaining,
     ): self {
         return new self(
-            permitido: true,
-            restante: max(0, $restante),
-            limite: $politica->capacidade,
-            tentarNovamenteEm: 0,
-            algoritmo: $politica->algoritmo->value,
-            chave: $chave,
+            allowed: true,
+            remaining: max(0, $remaining),
+            limit: $policy->capacity,
+            retryAfter: 0,
+            algorithm: $policy->algorithm->value,
+            key: $key,
         );
     }
 
     /**
      * Recebe: política, chave e segundos até a janela expirar. Faz: monta
-     * veredito de negação; "restante" é 0 por definição — se sobrasse saldo,
+     * veredito de negação; "remaining" é 0 por definição — se sobrasse saldo,
      * a requisição não teria sido negada. Retorna: resultado negado.
      * Efeitos colaterais: nenhum.
      */
-    public static function negado(
-        PoliticaLimitacao $politica,
-        string $chave,
-        int $tentarNovamenteEm,
+    public static function denied(
+        RateLimitPolicy $policy,
+        string $key,
+        int $retryAfter,
     ): self {
         return new self(
-            permitido: false,
-            restante: 0,
-            limite: $politica->capacidade,
+            allowed: false,
+            remaining: 0,
+            limit: $policy->capacity,
             // Nunca instruir retry imediato (mínimo de 1s) para não convidar
             // o cliente a martelar a API no instante da expiração.
-            tentarNovamenteEm: max(1, $tentarNovamenteEm),
-            algoritmo: $politica->algoritmo->value,
-            chave: $chave,
+            retryAfter: max(1, $retryAfter),
+            algorithm: $policy->algorithm->value,
+            key: $key,
         );
     }
 }

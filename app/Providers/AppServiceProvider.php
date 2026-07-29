@@ -10,7 +10,7 @@ use Illuminate\Support\ServiceProvider;
  * Provider padrão da aplicação.
  *
  * Responsabilidade: intencionalmente vazio nas Fases 0 e 1 — todo o wiring
- * do limitador vive em LimitacaoRequisicoesServiceProvider para manter o
+ * do limitador vive em RateLimitingServiceProvider para manter o
  * domínio isolado e fácil de auditar.
  */
 class AppServiceProvider extends ServiceProvider
