@@ -1,0 +1,63 @@
+{
+    "$schema": "https://getcomposer.org/schema.json",
+    "name": "portfolio/rate-limiter-portfolio",
+    "type": "project",
+    "description": "Rate limiter distribuído customizado em Laravel — exercício de portfólio (Fases 0 e 1: framing, contratos e limitador ingênuo com prova de race condition).",
+    "keywords": ["laravel", "rate-limiter", "redis", "portfolio"],
+    "license": "MIT",
+    "require": {
+        "php": "^8.2",
+        "ext-redis": "*",
+        "laravel/framework": "^12.0"
+    },
+    "require-dev": {
+        "fakerphp/faker": "^1.23",
+        "mockery/mockery": "^1.6",
+        "nunomaduro/collision": "^8.6",
+        "pestphp/pest": "^3.7",
+        "pestphp/pest-plugin-laravel": "^3.1"
+    },
+    "autoload": {
+        "psr-4": {
+            "App\\": "app/",
+            "Database\\Factories\\": "database/factories/",
+            "Database\\Seeders\\": "database/seeders/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "post-autoload-dump": [
+            "Illuminate\\Foundation\\ComposerScripts::postAutoloadDump",
+            "@php artisan package:discover --ansi"
+        ],
+        "post-root-package-install": [
+            "@php -r \"file_exists('.env') || copy('.env.example', '.env');\""
+        ],
+        "post-create-project-cmd": [
+            "@php artisan key:generate --ansi"
+        ],
+        "test": [
+            "@php artisan test"
+        ]
+    },
+    "extra": {
+        "laravel": {
+            "dont-discover": []
+        }
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "preferred-install": "dist",
+        "sort-packages": true,
+        "allow-plugins": {
+            "pestphp/pest-plugin": true,
+            "php-http/discovery": true
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
