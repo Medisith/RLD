@@ -8,12 +8,14 @@ use App\RateLimiting\Algorithms\RateLimitAlgorithmFactory;
 use App\RateLimiting\Contracts\RateLimitKeyResolver;
 use App\RateLimiting\Exceptions\InvalidRateLimitPolicyException;
 use App\RateLimiting\Exceptions\RedisUnavailableException;
+use App\RateLimiting\Resolvers\TenantQuotaResolver;
 use App\RateLimiting\Support\FailureMode;
 use App\RateLimiting\Support\KeyAnonymizer;
 use App\RateLimiting\Support\RateLimitMetric;
 use App\RateLimiting\Support\RateLimitMetrics;
 use App\RateLimiting\Support\RateLimitPolicy;
 use App\RateLimiting\Support\RateLimitResult;
+use App\RateLimiting\Support\RateLimitScope;
 use Closure;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -59,27 +61,30 @@ final readonly class AdvancedRateLimiterMiddleware
     private const int RETRY_AFTER_ON_FAILURE_SECONDS = 5;
 
     /**
-     * Recebe: a fábrica de algoritmos, o resolvedor de chave e (Fase 6) o
-     * registrador de métricas e o pseudonimizador de chaves para logs —
-     * todos injetados pelo RateLimitingServiceProvider. Faz: guarda
-     * dependências. Retorna: instância imutável. Efeitos colaterais: nenhum.
+     * Recebe: a fábrica de algoritmos, o resolvedor de chave, (Fase 6) o
+     * registrador de métricas e o pseudonimizador de chaves para logs e
+     * (Fase 9) o resolvedor de quota de tenant — todos injetados pelo
+     * RateLimitingServiceProvider. Faz: guarda dependências. Retorna:
+     * instância imutável. Efeitos colaterais: nenhum.
      */
     public function __construct(
         private RateLimitAlgorithmFactory $algorithmFactory,
         private RateLimitKeyResolver $keyResolver,
         private RateLimitMetrics $metrics,
         private KeyAnonymizer $keyAnonymizer,
+        private TenantQuotaResolver $tenantQuotaResolver,
     ) {
     }
 
     /**
      * Recebe: requisição e próximo estágio do pipeline. Faz: quando o
-     * limitador está habilitado, resolve política e chave, seleciona o
-     * algoritmo declarado pela política e (a) nega com 429 JSON + headers,
-     * (b) deixa seguir e anexa os headers informativos, ou (c) aplica o
-     * failure_mode se o Redis estiver fora. Retorna: a resposta HTTP.
-     * Efeitos colaterais: consumo de saldo no Redis via algoritmo; logs de
-     * negação e de falha de infraestrutura.
+     * limitador está habilitado, resolve política e chave, consome o balde
+     * do CLIENTE e, se ele permitir e houver quota de tenant aplicável
+     * (Fase 9), consome também o balde do TENANT; então (a) nega com 429
+     * JSON + headers, (b) deixa seguir e anexa os headers do balde mais
+     * restritivo, ou (c) aplica o failure_mode se o Redis estiver fora.
+     * Retorna: a resposta HTTP. Efeitos colaterais: consumo de saldo no
+     * Redis; logs de negação e de falha de infraestrutura.
      */
     public function handle(Request $request, Closure $next): Response
     {
@@ -90,15 +95,50 @@ final readonly class AdvancedRateLimiterMiddleware
         $policy = $this->policyForRequest($request);
         $resolvedKey = $this->keyResolver->resolve($request, $policy);
 
-        // Seleção POR POLÍTICA: cada rota escolhe seu algoritmo na config.
-        $algorithm = $this->algorithmFactory->forAlgorithm($policy->algorithm);
-
         try {
-            $rateLimitResult = $algorithm->attempt(
-                key: $resolvedKey,
-                policy: $policy,
-                cost: $policy->defaultCost,
-            );
+            // --------------------------------------------------------------
+            // CHECK 1 — balde do CLIENTE (sempre). Seleção POR POLÍTICA:
+            // cada rota escolhe seu algoritmo na config.
+            // --------------------------------------------------------------
+            $clientResult = $this->algorithmFactory
+                ->forAlgorithm($policy->algorithm)
+                ->attempt(key: $resolvedKey, policy: $policy, cost: $policy->defaultCost);
+
+            if (! $clientResult->allowed) {
+                // Short-circuit deliberado: cliente barrado NÃO toca o balde
+                // do tenant. É isso que impede um único cliente abusivo de
+                // drenar a cota compartilhada da organização inteira.
+                return $this->denyAndReport($request, $clientResult, RateLimitScope::Client);
+            }
+
+            // --------------------------------------------------------------
+            // CHECK 2 — balde do TENANT (opcional, desligado por padrão).
+            // Dois checks sequenciais, cada um atômico em si; a dupla NÃO é
+            // atômica. Consequência assumida e documentada em
+            // docs/fases/fase-9: quando o tenant nega, o token já consumido
+            // do cliente não é devolvido (vazamento de no máximo 1 unidade
+            // por requisição negada pelo tenant). A alternativa — um script
+            // Lua composto com 2 KEYS que só escreve se AMBOS permitirem —
+            // elimina o vazamento, mas obriga os dois baldes ao mesmo
+            // algoritmo; trade-off registrado na doc da fase.
+            // --------------------------------------------------------------
+            $tenantQuota = $this->tenantQuotaResolver->resolve($request, $policy->name);
+
+            $tenantResult = null;
+
+            if ($tenantQuota !== null) {
+                $tenantResult = $this->algorithmFactory
+                    ->forAlgorithm($tenantQuota->policy->algorithm)
+                    ->attempt(
+                        key: $tenantQuota->key,
+                        policy: $tenantQuota->policy,
+                        cost: $policy->defaultCost,
+                    );
+
+                if (! $tenantResult->allowed) {
+                    return $this->denyAndReport($request, $tenantResult, RateLimitScope::Tenant);
+                }
+            }
         } catch (RedisUnavailableException $failure) {
             // Somente indisponibilidade de INFRAESTRUTURA cai aqui.
             // LuaScriptFailureException e InvalidRateLimitPolicyException
@@ -108,21 +148,24 @@ final readonly class AdvancedRateLimiterMiddleware
             return $this->handleInfrastructureFailure($request, $next, $resolvedKey, $failure);
         }
 
-        if (! $rateLimitResult->allowed) {
-            $this->metrics->increment(RateLimitMetric::DeniedTotal);
-
-            return $this->deniedResponse($request, $rateLimitResult);
-        }
-
         $this->metrics->increment(RateLimitMetric::AllowedTotal);
+
+        // Headers vêm do balde MAIS RESTRITIVO (menor saldo restante), como
+        // conjunto coerente de um único balde — nunca limit de um com
+        // remaining de outro. Sem quota de tenant, é sempre o do cliente:
+        // contrato das fases anteriores preservado byte a byte.
+        $bindingResult = $this->mostRestrictive($clientResult, $tenantResult);
 
         // Allow em nível debug (Fase 6): estruturado e SEM PII crua, mas
         // silencioso em produção com LOG_LEVEL >= info — allows são a vasta
         // maioria do tráfego e log por request em info seria ruído caro.
         Log::debug('Request allowed by the custom rate limiter.', [
-            'key' => $this->keyAnonymizer->anonymize($rateLimitResult->key),
-            'algorithm' => $rateLimitResult->algorithm,
-            'remaining' => $rateLimitResult->remaining,
+            'key' => $this->keyAnonymizer->anonymize($bindingResult->key),
+            'algorithm' => $bindingResult->algorithm,
+            'remaining' => $bindingResult->remaining,
+            'binding_scope' => $bindingResult === $clientResult
+                ? RateLimitScope::Client->value
+                : RateLimitScope::Tenant->value,
             ...$this->requestContext($request),
         ]);
 
@@ -130,11 +173,42 @@ final readonly class AdvancedRateLimiterMiddleware
 
         // Também na resposta permitida o cliente enxerga seu saldo — contrato
         // de produto definido na Fase 0 (Reset entregue na Fase 4).
-        $response->headers->set(self::HEADER_LIMIT, (string) $rateLimitResult->limit);
-        $response->headers->set(self::HEADER_REMAINING, (string) $rateLimitResult->remaining);
-        $response->headers->set(self::HEADER_RESET, (string) $rateLimitResult->resetAfter);
+        $response->headers->set(self::HEADER_LIMIT, (string) $bindingResult->limit);
+        $response->headers->set(self::HEADER_REMAINING, (string) $bindingResult->remaining);
+        $response->headers->set(self::HEADER_RESET, (string) $bindingResult->resetAfter);
 
         return $response;
+    }
+
+    /**
+     * Recebe: os vereditos permitidos do cliente e (opcionalmente) do
+     * tenant. Faz: escolhe o balde que está mais perto de esgotar — é ele
+     * que o cliente precisa enxergar nos headers. Empate ou ausência de
+     * tenant resolve para o cliente, preservando o comportamento anterior.
+     * Retorna: o resultado vinculante. Efeitos colaterais: nenhum.
+     */
+    private function mostRestrictive(RateLimitResult $clientResult, ?RateLimitResult $tenantResult): RateLimitResult
+    {
+        if ($tenantResult === null) {
+            return $clientResult;
+        }
+
+        return $tenantResult->remaining < $clientResult->remaining
+            ? $tenantResult
+            : $clientResult;
+    }
+
+    /**
+     * Recebe: a requisição, o veredito negado e o escopo do balde que negou.
+     * Faz: contabiliza a negação na métrica e monta a resposta 429.
+     * Retorna: JsonResponse 429. Efeitos colaterais: incremento de métrica
+     * e escrita em log (dentro de deniedResponse).
+     */
+    private function denyAndReport(Request $request, RateLimitResult $result, RateLimitScope $scope): JsonResponse
+    {
+        $this->metrics->increment(RateLimitMetric::DeniedTotal);
+
+        return $this->deniedResponse($request, $result, $scope);
     }
 
     /**
@@ -167,17 +241,22 @@ final readonly class AdvancedRateLimiterMiddleware
     }
 
     /**
-     * Recebe: a requisição e o veredito negado. Faz: registra a negação em
-     * log estruturado SEM PII crua (chave pseudonimizada — Fase 6, com
-     * request_id quando o proxy/cliente enviar X-Request-Id) e monta a
-     * resposta 429 com corpo JSON e headers do contrato de produto.
-     * Retorna: JsonResponse 429. Efeitos colaterais: escrita em log.
+     * Recebe: a requisição, o veredito negado e o escopo do balde que negou
+     * (Fase 9). Faz: registra a negação em log estruturado SEM PII crua
+     * (chave pseudonimizada — Fase 6, com request_id quando o proxy/cliente
+     * enviar X-Request-Id) e monta a resposta 429 com corpo JSON e headers
+     * do contrato de produto. Retorna: JsonResponse 429. Efeitos
+     * colaterais: escrita em log.
      */
-    private function deniedResponse(Request $request, RateLimitResult $rateLimitResult): JsonResponse
-    {
+    private function deniedResponse(
+        Request $request,
+        RateLimitResult $rateLimitResult,
+        RateLimitScope $scope,
+    ): JsonResponse {
         Log::info('Request denied by the custom rate limiter.', [
             'key' => $this->keyAnonymizer->anonymize($rateLimitResult->key),
             'algorithm' => $rateLimitResult->algorithm,
+            'scope' => $scope->value,
             'limit' => $rateLimitResult->limit,
             'retry_after' => $rateLimitResult->retryAfter,
             'reset_after' => $rateLimitResult->resetAfter,
@@ -191,6 +270,10 @@ final readonly class AdvancedRateLimiterMiddleware
                     $rateLimitResult->retryAfter,
                 ),
                 'code' => 'RATE_LIMIT_EXCEEDED',
+                // Campo aditivo (Fase 9): diz ao consumidor se ele esgotou a
+                // própria cota ("client") ou a cota compartilhada da
+                // organização ("tenant") — a ação corretiva é diferente.
+                'scope' => $scope->value,
                 'limit' => $rateLimitResult->limit,
                 'retry_after' => $rateLimitResult->retryAfter,
             ],

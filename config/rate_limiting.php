@@ -72,14 +72,34 @@ return [
             'capacity' => 50,
             'default_cost' => 1,
             'key_strategy' => 'user_or_ip',
-            'algorithm' => 'token_bucket',
+            // Env-driven (Fase 8) para facilitar a comparação de carga sem
+            // editar código: RATE_LIMIT_PING_ALGORITHM=naive|token_bucket|
+            // leaky_bucket. window/refill/leak herdam da config global.
+            'algorithm' => env('RATE_LIMIT_PING_ALGORITHM', 'token_bucket'),
             'refill_rate' => 1.0,
-
-            // Alternativas de demonstração (trocar 'algorithm' acima):
-            //   'algorithm' => 'leaky_bucket', 'leak_rate' => 1.0,
-            //   'algorithm' => 'naive', 'window_seconds' => 60,  // reproduz a Fase 1
         ],
 
+    ],
+
+    // ------------------------------------------------------------------
+    // Quota composta por TENANT (Fase 9) — DESLIGADA por padrão.
+    //
+    // Com enabled=true e o header presente, cada requisição passa por DOIS
+    // checks: o do cliente (acima) e o do balde do tenant, compartilhado
+    // por todos os clientes daquele tenant na mesma rota. Chave:
+    // rate-limit:tenant:{tenantId}:{routeName}. A ordem é CLIENTE-primeiro
+    // (justificativa em docs/fases/fase-9-tenant-quotas-and-runbook.md).
+    // Os campos abaixo são mesclados sobre a config global (mesma regra
+    // das políticas por rota); limites por tenant INDIVIDUAL (planos) e
+    // overrides por rota ficam fora do escopo desta fase.
+    // ------------------------------------------------------------------
+    'tenant' => [
+        'enabled' => (bool) env('RATE_LIMIT_TENANT_ENABLED', false),
+        'header' => env('RATE_LIMIT_TENANT_HEADER', 'X-Tenant-Id'),
+        'capacity' => (int) env('RATE_LIMIT_TENANT_CAPACITY', 200),
+        'algorithm' => env('RATE_LIMIT_TENANT_ALGORITHM', 'token_bucket'),
+        'refill_rate' => (float) env('RATE_LIMIT_TENANT_REFILL_RATE', 4.0),
+        'leak_rate' => (float) env('RATE_LIMIT_TENANT_LEAK_RATE', 4.0),
     ],
 
 ];
