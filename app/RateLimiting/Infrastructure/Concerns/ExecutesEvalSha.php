@@ -59,6 +59,11 @@ trait ExecutesEvalSha
                 );
             }
 
+            // Observabilidade (Fase 6): reidratação concluída — o adaptador
+            // decide se/como conta (LaravelRedisClient incrementa
+            // evalsha_reload_total; NativeRedisClient mantém o no-op).
+            $this->reportEvalShaReload();
+
             $client->clearLastError();
             $reply = $client->evalSha($script->sha1, $flatArguments, $keyCount);
 
@@ -81,6 +86,18 @@ trait ExecutesEvalSha
         }
 
         return $reply;
+    }
+
+    /**
+     * Recebe: nada. Faz: hook chamado após cada reidratação NOSCRIPT bem
+     * sucedida — no-op por padrão; o adaptador que tiver observabilidade
+     * disponível sobrescreve (métrica evalsha_reload_total). Retorna: void.
+     * Efeitos colaterais: nenhum por padrão; a implementação que sobrescreve
+     * DEVE ser best-effort (nunca falhar a decisão por causa de métrica).
+     */
+    protected function reportEvalShaReload(): void
+    {
+        // Intencionalmente vazio.
     }
 
     /**

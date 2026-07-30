@@ -113,6 +113,30 @@ test('disabled limiter lets the request through without remaining headers', func
     expect($response->headers->has('X-RateLimit-Limit'))->toBeFalse();
 });
 
+test('route cost override consumes multiple units per request', function (): void {
+    // Fase 7 — cost override por rota: cada requisição desta política
+    // consome 5 unidades de uma capacidade 10 (2 requisições e acabou).
+    config()->set('rate_limiting.policies', [
+        'rate-limited.ping' => [
+            'capacity' => 10,
+            'window_seconds' => 60,
+            'default_cost' => 5,
+            'key_strategy' => 'ip',
+            'algorithm' => 'naive',
+        ],
+    ]);
+
+    $this->postJson('/api/rate-limited/ping')
+        ->assertOk()
+        ->assertHeader('X-RateLimit-Remaining', '5');
+
+    $this->postJson('/api/rate-limited/ping')
+        ->assertOk()
+        ->assertHeader('X-RateLimit-Remaining', '0');
+
+    $this->postJson('/api/rate-limited/ping')->assertStatus(429);
+});
+
 // ---------------------------------------------------------------------------
 // failure_mode (honrado desde a Fase 2): os dois testes abaixo derrubam o
 // Redis DE VERDADE para este processo — reapontam a conexão para uma porta

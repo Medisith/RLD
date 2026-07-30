@@ -28,13 +28,15 @@ const GLOBAL_TEST_CONFIG = [
 test('route config overrides global values and inherits the rest', function (): void {
     $policy = RateLimitPolicy::fromConfig(
         name: 'rate-limited.ping',
-        routeConfig: ['capacity' => 10, 'algorithm' => 'token_bucket', 'refill_rate' => 2.5],
+        // default_cost por rota incluído de propósito (Fase 7): o cost
+        // override é contrato de config, não acidente da mescla.
+        routeConfig: ['capacity' => 10, 'default_cost' => 3, 'algorithm' => 'token_bucket', 'refill_rate' => 2.5],
         globalConfig: GLOBAL_TEST_CONFIG,
     );
 
     expect($policy->capacity)->toBe(10)
         ->and($policy->windowSeconds)->toBe(60)
-        ->and($policy->defaultCost)->toBe(1)
+        ->and($policy->defaultCost)->toBe(3)
         ->and($policy->keyStrategy)->toBe(KeyStrategy::UserOrIp)
         ->and($policy->algorithm)->toBe(AvailableAlgorithm::TokenBucket)
         ->and($policy->refillRate)->toBe(2.5);

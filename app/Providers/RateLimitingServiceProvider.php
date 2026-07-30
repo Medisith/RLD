@@ -13,6 +13,8 @@ use App\RateLimiting\Exceptions\InvalidRateLimitPolicyException;
 use App\RateLimiting\Infrastructure\LaravelRedisClient;
 use App\RateLimiting\Resolvers\DefaultKeyResolver;
 use App\RateLimiting\Support\AvailableAlgorithm;
+use App\RateLimiting\Support\KeyAnonymizer;
+use App\RateLimiting\Support\RateLimitMetrics;
 use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Contracts\Redis\Factory as RedisFactory;
 use Illuminate\Support\ServiceProvider;
@@ -38,12 +40,33 @@ class RateLimitingServiceProvider extends ServiceProvider
      */
     public function register(): void
     {
+        // Observabilidade (Fase 6): métricas best-effort e pseudonimização
+        // de chave para logs. Registradas antes do adaptador Redis, que
+        // conta reidratações EVALSHA através delas.
+        $this->app->singleton(RateLimitMetrics::class, function (Application $app): RateLimitMetrics {
+            return new RateLimitMetrics(
+                redisFactory: $app->make(RedisFactory::class),
+            );
+        });
+
+        $this->app->singleton(KeyAnonymizer::class, function (Application $app): KeyAnonymizer {
+            // APP_KEY como segredo do HMAC: pseudônimo estável por app, não
+            // reversível sem o segredo. Fallback fixo apenas para contextos
+            // sem chave (ex.: comandos muito precoces) — documentado.
+            $secret = (string) $app->make('config')->get('app.key', '');
+
+            return new KeyAnonymizer(
+                secret: $secret !== '' ? $secret : 'rate-limiter-portfolio-fallback-secret',
+            );
+        });
+
         // Adaptador concreto único: a MESMA conexão física serve as duas
         // portas (comandos individuais e EVAL). A separação que protege o
         // desenho está nos contratos que cada algoritmo recebe.
         $this->app->singleton(LaravelRedisClient::class, function (Application $app): LaravelRedisClient {
             return new LaravelRedisClient(
                 redisFactory: $app->make(RedisFactory::class),
+                metrics: $app->make(RateLimitMetrics::class),
             );
         });
 

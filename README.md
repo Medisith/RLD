@@ -30,6 +30,9 @@ docker compose up -d      # sobe SÓ o Redis (ou use um Redis local seu)
 ./scripts/demo.sh         # roda as três provas e imprime o contraste (Windows: scripts/demo.ps1)
 ```
 
+Tem 5 minutos? O roteiro completo de avaliação está em
+[docs/fases/fase-7-portfolio-closure.md](docs/fases/fase-7-portfolio-closure.md).
+
 A demo não exige `composer install` — o script de prova carrega os mesmos algoritmos do
 middleware por autoloader próprio. Para a aplicação HTTP completa:
 
@@ -77,7 +80,25 @@ saída em `leak_rate`/s — proteja downstream rígido (gateway de pagamento, SL
 php artisan rate-limit:inspect "rate-limit:ip:203.0.113.10:rate-limited.ping"   # estado bruto (read-only)
 php artisan rate-limit:reset   "rate-limit:ip:203.0.113.10:rate-limited.ping"   # volta ao repouso
 php artisan rate-limit:dry-run rate-limited.ping --identifier=203.0.113.10      # política efetiva, sem consumir
+php artisan rate-limit:metrics                                                   # contadores (--reset para zerar)
 ```
+
+## Observabilidade e IP atrás de proxy (Fase 6)
+
+- **Logs sem PII crua:** toda linha do limitador loga a chave PSEUDONIMIZADA — o identificador
+  (IP/id de usuário) vira HMAC-SHA256 truncado com a `APP_KEY` como segredo; estratégia e rota
+  ficam legíveis. Mesmo cliente = mesmo pseudônimo (correlação preservada), sem reversão. Denies
+  em `info`, allows em `debug` (silenciosos em produção), `request_id` incluído quando o
+  cliente/proxy envia `X-Request-Id`.
+- **Métricas mínimas:** `allowed_total`, `denied_total`, `redis_errors_total` e
+  `evalsha_reload_total` em um hash no Redis (HINCRBY best-effort — métrica nunca derruba
+  requisição; com Redis fora, degrada para linha de log `rate_limit_metric`). Exibição via
+  `php artisan rate-limit:metrics`. Sem Prometheus de propósito: leve e demonstrável localmente.
+- **TrustProxies explícito:** por padrão NENHUM proxy é confiável — `X-Forwarded-For` de cliente
+  direto é ignorado (spoof não escolhe balde). Atrás de LB, configure
+  `TRUSTED_PROXIES=<ips/cidrs>` (ou `*` somente se o app é inalcançável fora do LB). Com
+  `config:cache`, defina como variável de ambiente real — caveat documentado no bootstrap e na
+  fase 6.
 
 ## Testes
 
@@ -87,21 +108,28 @@ php artisan test
 
 Exigem Redis real (banco 15; pulados com aviso se ausente). Cobrem contrato HTTP, semântica dos
 três algoritmos, invariantes de política e de resultado, failure_mode com conexão derrubada de
-verdade, reidratação pós-`SCRIPT FLUSH` e os comandos de operação. Testes são sequenciais e não
-provam atomicidade — isso é papel exclusivo do script de provas.
+verdade, reidratação pós-`SCRIPT FLUSH`, comandos de operação, proxy confiável vs spoof de
+`X-Forwarded-For`, logs sem vazamento de PII, métricas e cost override por rota. Testes são
+sequenciais e não provam atomicidade — isso é papel exclusivo do script de provas.
+
+**CI (Fase 7):** `.github/workflows/ci.yml` roda em cada push/PR — Redis 7 como service
+container, lint, a suíte Pest inteira e as três provas de concorrência como smoke, deixando os
+vereditos no log do job.
 
 ## Checklist de honestidade — o que isto ainda NÃO é
 
-- **Não é um pacote de produção:** sem observabilidade (métricas/tracing), sem teste de carga
-  (k6 — fora de escopo por regra), sem Nginx/edge (fora de escopo), sem multi-tenant.
+- **Não é um pacote de produção:** observabilidade é a MÍNIMA (4 contadores + logs
+  estruturados — sem série temporal, tracing ou alertas), sem teste de carga (k6 — fora de
+  escopo por regra), sem Nginx/edge (fora de escopo), sem multi-tenant.
 - **Redis único, sem HA:** cluster/sentinel e as consequências para EVALSHA/TIME não são
   tratados; `failure_mode` cobre indisponibilidade, não split-brain.
-- **Chave por IP pressupõe IP real:** atrás de proxy/CDN exige trusted proxies configurado —
-  não incluído.
-- **Testes automatizados:** escritos, porém a execução do `php artisan test` está PENDENTE DE
-  EXECUÇÃO no ambiente desta entrega (Packagist bloqueado — sem `vendor/`); rode localmente.
-  Toda a mecânica Redis (provas, EVALSHA, NOSCRIPT) FOI executada de verdade e está registrada
-  nas docs com números reais.
+- **Chave por IP atrás de proxy exige `TRUSTED_PROXIES` correto:** o padrão seguro (nenhum
+  proxy confiável) vira balde único atrás de LB até você configurar a lista — documentado na
+  fase 6; cardinalidade de chaves sob flood distribuído é limitada pelos TTLs, não eliminada.
+- **Testes automatizados e CI:** escritos e prontos, porém `php artisan test` e a primeira
+  rodada do workflow estão PENDENTES DE EXECUÇÃO no ambiente desta entrega (Packagist
+  bloqueado — sem `vendor/`; Actions roda no GitHub). Toda a mecânica Redis (provas, EVALSHA,
+  NOSCRIPT, anonimização) FOI executada de verdade e está registrada nas docs com números reais.
 - **Feito, apesar do nome "futuro" em fases antigas:** `SCRIPT LOAD`/EVALSHA (Fase 4),
   `X-RateLimit-Reset` (Fase 4), `failure_mode` honrado (Fase 2).
 
@@ -116,6 +144,8 @@ provam atomicidade — isso é papel exclusivo do script de provas.
 | [docs/fases/fase-3-leaky-bucket.md](docs/fases/fase-3-leaky-bucket.md) | Leaky Bucket e comparativo Token vs Leaky |
 | [docs/fases/fase-4-evalsha-and-ops.md](docs/fases/fase-4-evalsha-and-ops.md) | EVAL vs EVALSHA, X-RateLimit-Reset, comandos de ops |
 | [docs/fases/fase-5-portfolio-packaging.md](docs/fases/fase-5-portfolio-packaging.md) | Empacotamento, demo e checklist de honestidade |
+| [docs/fases/fase-6-observability-and-hardening.md](docs/fases/fase-6-observability-and-hardening.md) | Logs sem PII, métricas mínimas, TrustProxies, limites conhecidos |
+| [docs/fases/fase-7-portfolio-closure.md](docs/fases/fase-7-portfolio-closure.md) | CI com Redis service e o roteiro de avaliação em 5 minutos |
 
 ## Estrutura do domínio
 
@@ -127,7 +157,8 @@ app/RateLimiting/
 ├── Algorithms/      NaiveRedisRateLimiter, TokenBucketRateLimiter,
 │                    LeakyBucketRateLimiter, RateLimitAlgorithmFactory
 ├── Redis/           LuaScript (fonte + SHA-1) e scripts/*.lua (fonte de verdade)
-├── Support/         RateLimitPolicy, RateLimitResult, enums
+├── Support/         RateLimitPolicy, RateLimitResult, enums,
+│                    RateLimitMetrics + KeyAnonymizer (observabilidade — Fase 6)
 ├── Resolvers/       DefaultKeyResolver (rate-limit:{strategy}:{identifier}:{routeName})
 ├── Infrastructure/  LaravelRedisClient, NativeRedisClient, Concerns/ExecutesEvalSha
 ├── Http/            AdvancedRateLimiterMiddleware (alias "rate-limit.advanced")

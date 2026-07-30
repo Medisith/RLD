@@ -1,0 +1,77 @@
+# =========================================================================
+# CI mínima do portfólio (Fase 7).
+#
+# Responsabilidade: a cada push/PR, provar que o projeto (1) instala,
+# (2) passa no lint, (3) passa na suíte Pest contra um Redis REAL (service
+# container — mesma imagem redis:7-alpine do docker-compose.yml) e
+# (4) mantém as garantias de concorrência: o naive DEVE sobre-admitir e os
+# buckets NÃO PODEM (as provas rodam como smoke — saída fica no log do job).
+#
+# Deliberadamente mínima: sem matriz de versões, sem cache sofisticado, sem
+# cobertura — CI de portfólio existe para um avaliador confiar no verde,
+# não para competir com pipeline de produto.
+# =========================================================================
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+jobs:
+  tests:
+    name: Lint, Pest suite and concurrency proofs
+    runs-on: ubuntu-latest
+
+    services:
+      # Mesmo Redis do docker-compose.yml: os testes falam com
+      # 127.0.0.1:6379 (portas publicadas no runner) e usam o banco 15
+      # (phpunit.xml) para isolar chaves de teste.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          # redis: extensão usada pela aplicação e pelas provas.
+          # pcntl: exigida pelo modo algorithm da prova de concorrência.
+          extensions: redis, pcntl
+          coverage: none
+
+      - name: Validate composer.json
+        run: composer validate
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress --no-interaction
+
+      - name: Lint PHP sources
+        run: find app config routes tests scripts -name '*.php' -print0 | xargs -0 -n1 -P4 php -l > /dev/null
+
+      - name: Prepare environment
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      - name: Run Pest suite (against the Redis service)
+        run: php artisan test
+
+      # Smoke de concorrência: os scripts imprimem os vereditos no log do
+      # job. Todos saem com código 0 — o valor aqui é a EVIDÊNCIA visível
+      # (naive sobre-admite; token/leaky cravam exatamente a capacidade).
+      - name: Concurrency proofs (naive over-admits; buckets do not)
+        run: |
+          php scripts/prove_race_condition.php --algorithm=naive --processes=30 --attempts=5 --rounds=2
+          php scripts/prove_race_condition.php --algorithm=token_bucket --refill-rate=1 --processes=30 --attempts=5 --rounds=2
+          php scripts/prove_race_condition.php --algorithm=leaky_bucket --leak-rate=1 --processes=30 --attempts=5 --rounds=2
