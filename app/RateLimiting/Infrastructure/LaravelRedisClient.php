@@ -10,6 +10,8 @@ use App\RateLimiting\Exceptions\RateLimitException;
 use App\RateLimiting\Exceptions\RedisUnavailableException;
 use App\RateLimiting\Infrastructure\Concerns\ExecutesEvalSha;
 use App\RateLimiting\Redis\LuaScript;
+use App\RateLimiting\Support\RateLimitMetric;
+use App\RateLimiting\Support\RateLimitMetrics;
 use Illuminate\Contracts\Redis\Factory as RedisFactory;
 use Throwable;
 
@@ -30,13 +32,28 @@ final readonly class LaravelRedisClient implements RateLimitRedisClient, RateLim
     use ExecutesEvalSha;
 
     /**
-     * Recebe: a fábrica de conexões Redis do framework. Faz: guarda a
-     * dependência. Retorna: instância imutável. Efeitos colaterais: nenhum
-     * (a conexão só é aberta no primeiro comando).
+     * Recebe: a fábrica de conexões Redis do framework e, opcionalmente, o
+     * registrador de métricas (Fase 6 — nulo em contextos sem
+     * observabilidade). Faz: guarda as dependências. Retorna: instância
+     * imutável. Efeitos colaterais: nenhum (a conexão só é aberta no
+     * primeiro comando).
      */
     public function __construct(
         private RedisFactory $redisFactory,
+        private ?RateLimitMetrics $metrics = null,
     ) {
+    }
+
+    /**
+     * Recebe: nada (hook do ExecutesEvalSha). Faz: conta a reidratação
+     * NOSCRIPT na métrica evalsha_reload_total quando há registrador
+     * disponível — increment() é best-effort por contrato, então este hook
+     * jamais derruba a decisão em andamento. Retorna: void. Efeitos
+     * colaterais: HINCRBY no Redis ou linha de log métrico.
+     */
+    protected function reportEvalShaReload(): void
+    {
+        $this->metrics?->increment(RateLimitMetric::EvalshaReloadTotal);
     }
 
     public function get(string $key): ?string

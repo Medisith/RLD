@@ -9,6 +9,9 @@ use App\RateLimiting\Contracts\RateLimitKeyResolver;
 use App\RateLimiting\Exceptions\InvalidRateLimitPolicyException;
 use App\RateLimiting\Exceptions\RedisUnavailableException;
 use App\RateLimiting\Support\FailureMode;
+use App\RateLimiting\Support\KeyAnonymizer;
+use App\RateLimiting\Support\RateLimitMetric;
+use App\RateLimiting\Support\RateLimitMetrics;
 use App\RateLimiting\Support\RateLimitPolicy;
 use App\RateLimiting\Support\RateLimitResult;
 use Closure;
@@ -56,13 +59,16 @@ final readonly class AdvancedRateLimiterMiddleware
     private const int RETRY_AFTER_ON_FAILURE_SECONDS = 5;
 
     /**
-     * Recebe: a fábrica de algoritmos e o resolvedor de chave via contratos
-     * (injetados pelo RateLimitingServiceProvider). Faz: guarda
+     * Recebe: a fábrica de algoritmos, o resolvedor de chave e (Fase 6) o
+     * registrador de métricas e o pseudonimizador de chaves para logs —
+     * todos injetados pelo RateLimitingServiceProvider. Faz: guarda
      * dependências. Retorna: instância imutável. Efeitos colaterais: nenhum.
      */
     public function __construct(
         private RateLimitAlgorithmFactory $algorithmFactory,
         private RateLimitKeyResolver $keyResolver,
+        private RateLimitMetrics $metrics,
+        private KeyAnonymizer $keyAnonymizer,
     ) {
     }
 
@@ -97,12 +103,28 @@ final readonly class AdvancedRateLimiterMiddleware
             // Somente indisponibilidade de INFRAESTRUTURA cai aqui.
             // LuaScriptFailureException e InvalidRateLimitPolicyException
             // propagam: são bugs, não incidentes.
+            $this->metrics->increment(RateLimitMetric::RedisErrorsTotal);
+
             return $this->handleInfrastructureFailure($request, $next, $resolvedKey, $failure);
         }
 
         if (! $rateLimitResult->allowed) {
-            return $this->deniedResponse($rateLimitResult);
+            $this->metrics->increment(RateLimitMetric::DeniedTotal);
+
+            return $this->deniedResponse($request, $rateLimitResult);
         }
+
+        $this->metrics->increment(RateLimitMetric::AllowedTotal);
+
+        // Allow em nível debug (Fase 6): estruturado e SEM PII crua, mas
+        // silencioso em produção com LOG_LEVEL >= info — allows são a vasta
+        // maioria do tráfego e log por request em info seria ruído caro.
+        Log::debug('Request allowed by the custom rate limiter.', [
+            'key' => $this->keyAnonymizer->anonymize($rateLimitResult->key),
+            'algorithm' => $rateLimitResult->algorithm,
+            'remaining' => $rateLimitResult->remaining,
+            ...$this->requestContext($request),
+        ]);
 
         $response = $next($request);
 
@@ -145,17 +167,21 @@ final readonly class AdvancedRateLimiterMiddleware
     }
 
     /**
-     * Recebe: o veredito negado. Faz: registra a negação em log e monta a
+     * Recebe: a requisição e o veredito negado. Faz: registra a negação em
+     * log estruturado SEM PII crua (chave pseudonimizada — Fase 6, com
+     * request_id quando o proxy/cliente enviar X-Request-Id) e monta a
      * resposta 429 com corpo JSON e headers do contrato de produto.
      * Retorna: JsonResponse 429. Efeitos colaterais: escrita em log.
      */
-    private function deniedResponse(RateLimitResult $rateLimitResult): JsonResponse
+    private function deniedResponse(Request $request, RateLimitResult $rateLimitResult): JsonResponse
     {
         Log::info('Request denied by the custom rate limiter.', [
-            'key' => $rateLimitResult->key,
+            'key' => $this->keyAnonymizer->anonymize($rateLimitResult->key),
             'algorithm' => $rateLimitResult->algorithm,
             'limit' => $rateLimitResult->limit,
             'retry_after' => $rateLimitResult->retryAfter,
+            'reset_after' => $rateLimitResult->resetAfter,
+            ...$this->requestContext($request),
         ]);
 
         return new JsonResponse(
@@ -178,6 +204,22 @@ final readonly class AdvancedRateLimiterMiddleware
                 self::HEADER_RESET => (string) $rateLimitResult->resetAfter,
             ],
         );
+    }
+
+    /**
+     * Recebe: a requisição corrente. Faz: monta o contexto de correlação
+     * para logs — request_id quando o cliente/proxy enviar X-Request-Id
+     * (Fase 6); nada é inventado quando o header não existe. Retorna: mapa
+     * possivelmente vazio para espalhar no contexto de log. Efeitos
+     * colaterais: nenhum.
+     *
+     * @return array<string, string>
+     */
+    private function requestContext(Request $request): array
+    {
+        $requestId = (string) $request->header('X-Request-Id', '');
+
+        return $requestId !== '' ? ['request_id' => $requestId] : [];
     }
 
     /**
@@ -204,16 +246,18 @@ final readonly class AdvancedRateLimiterMiddleware
 
         if ($failureMode === FailureMode::Open) {
             Log::warning('Rate limiter Redis unavailable — failure_mode=open, letting request through UNCOUNTED.', [
-                'key' => $resolvedKey,
+                'key' => $this->keyAnonymizer->anonymize($resolvedKey),
                 'error' => $failure->getMessage(),
+                ...$this->requestContext($request),
             ]);
 
             return $next($request);
         }
 
         Log::error('Rate limiter Redis unavailable — failure_mode=closed, rejecting request.', [
-            'key' => $resolvedKey,
+            'key' => $this->keyAnonymizer->anonymize($resolvedKey),
             'error' => $failure->getMessage(),
+            ...$this->requestContext($request),
         ]);
 
         return new JsonResponse(
