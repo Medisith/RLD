@@ -11,8 +11,9 @@ use App\RateLimiting\Support\RateLimitResult;
  * Contrato de todo algoritmo de limitação do exercício.
  *
  * Responsabilidade: definir a única porta entre a camada HTTP e a lógica de
- * decisão. O middleware conhece apenas este contrato — trocar o limitador
- * ingênuo pelo Token Bucket atômico (fase futura) não altera o middleware.
+ * decisão. O middleware conhece apenas este contrato — foi exatamente essa
+ * fronteira que permitiu entregar o Token Bucket (Fase 2) e o Leaky Bucket
+ * (Fase 3) sem alterar a orquestração HTTP, apenas o wiring.
  */
 interface RateLimitAlgorithm
 {

@@ -10,18 +10,24 @@ use App\RateLimiting\Exceptions\InvalidRateLimitPolicyException;
  * DTO imutável que descreve a política de limitação aplicada a uma rota.
  *
  * Responsabilidade: transportar, já validados, os parâmetros de negócio do
- * limitador (capacidade, janela, custo, estratégia de chave e algoritmo).
- * Uma vez construída, a política nunca muda — qualquer combinação inválida
- * falha na construção, nunca em tempo de decisão.
+ * limitador. Uma vez construída, a política nunca muda — qualquer combinação
+ * inválida falha na construção, nunca em tempo de decisão.
+ *
+ * Parâmetros por algoritmo (validação condicionada ao algoritmo escolhido):
+ *   naive        -> capacity + window_seconds (janela fixa)
+ *   token_bucket -> capacity (burst máximo) + refill_rate (tokens/segundo)
+ *   leaky_bucket -> capacity (volume máximo) + leak_rate (drenagem/segundo)
  */
 final readonly class RateLimitPolicy
 {
     /**
      * Recebe: nome da política (normalmente o nome da rota) e parâmetros de
-     * negócio. Faz: valida invariantes (capacidade, janela e custo devem ser
-     * positivos; custo não pode exceder a capacidade). Retorna: instância
-     * imutável. Efeitos colaterais: nenhum; lança InvalidRateLimitPolicyException
-     * se qualquer invariante for violada.
+     * negócio. Faz: valida invariantes gerais (capacidade, janela e custo
+     * positivos; custo <= capacidade) e as invariantes específicas do
+     * algoritmo (refill_rate > 0 para token_bucket; leak_rate > 0 para
+     * leaky_bucket). Retorna: instância imutável. Efeitos colaterais:
+     * nenhum; lança InvalidRateLimitPolicyException se qualquer invariante
+     * for violada.
      */
     public function __construct(
         public string $name,
@@ -30,6 +36,12 @@ final readonly class RateLimitPolicy
         public int $defaultCost,
         public KeyStrategy $keyStrategy,
         public AvailableAlgorithm $algorithm,
+        // Tokens recarregados por segundo — obrigatório (> 0) quando
+        // algorithm = token_bucket; ignorado pelos demais.
+        public ?float $refillRate = null,
+        // Unidades drenadas por segundo — obrigatório (> 0) quando
+        // algorithm = leaky_bucket; ignorado pelos demais.
+        public ?float $leakRate = null,
     ) {
         if ($this->name === '') {
             throw InvalidRateLimitPolicyException::forReason('policy name cannot be empty');
@@ -58,6 +70,31 @@ final readonly class RateLimitPolicy
                 "default_cost ({$this->defaultCost}) cannot exceed capacity ({$this->capacity}) on policy '{$this->name}'"
             );
         }
+
+        // Invariantes específicas por algoritmo: falha na CONSTRUÇÃO, nunca
+        // dentro do script Lua — um EVAL com taxa inválida produziria
+        // divisão por zero ou TTL sem sentido silenciosamente.
+        if ($this->algorithm === AvailableAlgorithm::TokenBucket
+            && ($this->refillRate === null || $this->refillRate <= 0.0)) {
+            throw InvalidRateLimitPolicyException::forReason(
+                sprintf(
+                    "refill_rate must be > 0 (received: %s) on token_bucket policy '%s'",
+                    $this->refillRate === null ? 'null' : (string) $this->refillRate,
+                    $this->name,
+                )
+            );
+        }
+
+        if ($this->algorithm === AvailableAlgorithm::LeakyBucket
+            && ($this->leakRate === null || $this->leakRate <= 0.0)) {
+            throw InvalidRateLimitPolicyException::forReason(
+                sprintf(
+                    "leak_rate must be > 0 (received: %s) on leaky_bucket policy '%s'",
+                    $this->leakRate === null ? 'null' : (string) $this->leakRate,
+                    $this->name,
+                )
+            );
+        }
     }
 
     /**
@@ -65,9 +102,9 @@ final readonly class RateLimitPolicy
      * array de configuração global (valores padrão). Faz: mescla rota sobre
      * global, converte strings da config em enums e valida tudo no
      * construtor. Retorna: RateLimitPolicy pronta para uso. Efeitos
-     * colaterais: nenhum; lança InvalidRateLimitPolicyException para estratégia ou
-     * algoritmo desconhecidos — falha explícita em vez de assumir default
-     * silencioso.
+     * colaterais: nenhum; lança InvalidRateLimitPolicyException para
+     * estratégia ou algoritmo desconhecidos — falha explícita em vez de
+     * assumir default silencioso.
      *
      * @param  array<string, mixed>  $routeConfig
      * @param  array<string, mixed>  $globalConfig
@@ -88,7 +125,7 @@ final readonly class RateLimitPolicy
         $rawAlgorithm = (string) ($merged['algorithm'] ?? '');
         $algorithm = AvailableAlgorithm::tryFrom($rawAlgorithm)
             ?? throw InvalidRateLimitPolicyException::forReason(
-                "unknown algorithm '{$rawAlgorithm}' on policy '{$name}' — only 'naive' exists in phases 0 and 1"
+                "unknown algorithm '{$rawAlgorithm}' on policy '{$name}' — valid values: naive, token_bucket, leaky_bucket"
             );
 
         return new self(
@@ -98,6 +135,8 @@ final readonly class RateLimitPolicy
             defaultCost: (int) ($merged['default_cost'] ?? 0),
             keyStrategy: $keyStrategy,
             algorithm: $algorithm,
+            refillRate: isset($merged['refill_rate']) ? (float) $merged['refill_rate'] : null,
+            leakRate: isset($merged['leak_rate']) ? (float) $merged['leak_rate'] : null,
         );
     }
 }
