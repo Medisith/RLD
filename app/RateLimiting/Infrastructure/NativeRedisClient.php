@@ -5,21 +5,26 @@ declare(strict_types=1);
 namespace App\RateLimiting\Infrastructure;
 
 use App\RateLimiting\Contracts\RateLimitRedisClient;
+use App\RateLimiting\Contracts\RateLimitScriptRunner;
+use App\RateLimiting\Exceptions\LuaScriptFailureException;
+use App\RateLimiting\Exceptions\RateLimitException;
 use App\RateLimiting\Exceptions\RedisUnavailableException;
 use Redis;
 use Throwable;
 
 /**
- * Adaptador do contrato RateLimitRedisClient sobre a extensão phpredis
- * pura, SEM nenhuma dependência do framework.
+ * Adaptador dos contratos RateLimitRedisClient (comandos individuais) e
+ * RateLimitScriptRunner (EVAL atômico) sobre a extensão phpredis pura,
+ * SEM nenhuma dependência do framework.
  *
- * Responsabilidade: permitir que o MESMO NaiveRedisRateLimiter usado pelo
- * middleware rode em processos PHP avulsos — é o que a prova de race
+ * Responsabilidade: permitir que os MESMOS algoritmos usados pelo
+ * middleware (naive, token_bucket, leaky_bucket) rodem em processos PHP
+ * avulsos — é o que a prova de concorrência
  * (scripts/prove_race_condition.php) usa para disparar dezenas de
- * processos concorrentes sem subir a aplicação inteira. Comportamento de
- * comandos idêntico ao LaravelRedisClient por contrato.
+ * processos concorrentes sem subir a aplicação inteira. Comportamento
+ * idêntico ao LaravelRedisClient por contrato.
  */
-final class NativeRedisClient implements RateLimitRedisClient
+final class NativeRedisClient implements RateLimitRedisClient, RateLimitScriptRunner
 {
     private Redis $connection;
 
@@ -86,14 +91,49 @@ final class NativeRedisClient implements RateLimitRedisClient
     }
 
     /**
+     * Recebe: código Lua, KEYS e ARGV. Faz: EVAL via phpredis (execução
+     * atômica no servidor). Retorna: resposta bruta do Redis. Efeitos
+     * colaterais: os do script; lança RedisUnavailableException em falha de
+     * infraestrutura e LuaScriptFailureException quando o servidor reporta
+     * erro de script (phpredis devolve false e registra o erro em
+     * getLastError() em vez de lançar).
+     *
+     * @param  list<string>  $keys
+     * @param  list<int|float|string>  $arguments
+     */
+    public function evalScript(string $script, array $keys, array $arguments): mixed
+    {
+        return $this->run(function () use ($script, $keys, $arguments): mixed {
+            $this->connection->clearLastError();
+
+            $reply = $this->connection->eval($script, [...$keys, ...$arguments], count($keys));
+
+            if ($reply === false) {
+                $serverError = $this->connection->getLastError();
+
+                if ($serverError !== null) {
+                    $this->connection->clearLastError();
+
+                    throw LuaScriptFailureException::serverError($serverError);
+                }
+            }
+
+            return $reply;
+        });
+    }
+
+    /**
      * Recebe: comando em closure. Faz: executa convertendo falha de
-     * infraestrutura em RedisUnavailableException. Retorna: resultado bruto.
-     * Efeitos colaterais: os do comando.
+     * INFRAESTRUTURA em RedisUnavailableException; exceções de domínio já
+     * tipadas (ex.: LuaScriptFailureException do evalScript) atravessam
+     * intactas. Retorna: resultado bruto. Efeitos colaterais: os do comando.
      */
     private function run(callable $command): mixed
     {
         try {
             return $command();
+        } catch (RateLimitException $domainFailure) {
+            throw $domainFailure;
         } catch (Throwable $failure) {
             throw RedisUnavailableException::from($failure);
         }

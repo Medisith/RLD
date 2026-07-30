@@ -3,7 +3,13 @@
 declare(strict_types=1);
 
 /**
- * Testes de feature do AdvancedRateLimiterMiddleware (Fase 1).
+ * Testes de feature do AdvancedRateLimiterMiddleware (Fases 1 a 3).
+ *
+ * Os cenários de contagem abaixo usam a política 'naive' de propósito — o
+ * contrato HTTP (200/429/headers) independe do algoritmo, e a seleção
+ * por rota dos algoritmos atômicos é coberta em
+ * TokenBucketRateLimiterTest e LeakyBucketRateLimiterTest. Os dois últimos
+ * testes cobrem o failure_mode (open/closed), honrado desde a Fase 2.
  *
  * IMPORTANTE — limite honesto destes testes: tudo aqui é SEQUENCIAL (uma
  * requisição por vez). Teste sequencial NÃO prova nem refuta a race
@@ -98,4 +104,38 @@ test('disabled limiter lets the request through without remaining headers', func
     $response->assertOk()->assertJsonPath('message', 'pong');
 
     expect($response->headers->has('X-RateLimit-Limit'))->toBeFalse();
+});
+
+// ---------------------------------------------------------------------------
+// failure_mode (honrado desde a Fase 2): os dois testes abaixo derrubam o
+// Redis DE VERDADE para este processo — reapontam a conexão para uma porta
+// morta e purgam a conexão memoizada do RedisManager — e verificam cada modo.
+// ---------------------------------------------------------------------------
+
+test('failure_mode open lets the request through uncounted when Redis is down', function (): void {
+    config()->set('rate_limiting.failure_mode', 'open');
+    config()->set('database.redis.default.port', 6390); // porta morta
+    Redis::purge('default'); // força reconexão com a config quebrada
+
+    $response = $this->postJson('/api/rate-limited/ping');
+
+    // Passa sem contagem e SEM headers de saldo: sem Redis não há números
+    // honestos a informar.
+    $response->assertOk()->assertJsonPath('message', 'pong');
+
+    expect($response->headers->has('X-RateLimit-Limit'))->toBeFalse();
+});
+
+test('failure_mode closed rejects with 503 when Redis is down', function (): void {
+    config()->set('rate_limiting.failure_mode', 'closed');
+    config()->set('database.redis.default.port', 6390); // porta morta
+    Redis::purge('default'); // força reconexão com a config quebrada
+
+    $response = $this->postJson('/api/rate-limited/ping');
+
+    $response
+        ->assertStatus(503)
+        ->assertJsonPath('code', 'RATE_LIMITER_UNAVAILABLE');
+
+    expect((int) $response->headers->get('Retry-After'))->toBeGreaterThanOrEqual(1);
 });

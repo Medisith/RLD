@@ -4,8 +4,11 @@ declare(strict_types=1);
 
 namespace App\RateLimiting\Http;
 
-use App\RateLimiting\Contracts\RateLimitAlgorithm;
+use App\RateLimiting\Algorithms\RateLimitAlgorithmFactory;
 use App\RateLimiting\Contracts\RateLimitKeyResolver;
+use App\RateLimiting\Exceptions\InvalidRateLimitPolicyException;
+use App\RateLimiting\Exceptions\RedisUnavailableException;
+use App\RateLimiting\Support\FailureMode;
 use App\RateLimiting\Support\RateLimitPolicy;
 use App\RateLimiting\Support\RateLimitResult;
 use Closure;
@@ -19,16 +22,19 @@ use Symfony\Component\HttpFoundation\Response;
  *
  * Responsabilidade: orquestrar política -> chave -> algoritmo -> resposta
  * HTTP. Não contém lógica de contagem: decide apenas COMO responder ao
- * veredito do RateLimitAlgorithm (Fases 0 e 1: somente o limitador ingênuo,
- * intencionalmente vulnerável — ver NaiveRedisRateLimiter).
+ * veredito do RateLimitAlgorithm. A partir da Fase 3 o algoritmo é
+ * selecionado POR POLÍTICA (naive | token_bucket | leaky_bucket, por rota)
+ * via RateLimitAlgorithmFactory.
  *
  * Zero dependência do rate limiter nativo do Laravel: nenhum uso de
  * ThrottleRequests, da facade RateLimiter ou do alias "throttle".
  *
- * Falha de infraestrutura (Redis fora): a RedisUnavailableException propaga
- * e a requisição falha de forma explícita. O "failure_mode" (open|closed)
- * da config está reservado e será honrado em fase futura — decisão
- * registrada em docs/fases/fase-0-framing.md.
+ * Resiliência (honrada a partir da Fase 2): quando o Redis está
+ * indisponível (RedisUnavailableException), o "failure_mode" da config
+ * decide — "open" deixa a requisição passar sem contagem (log de alerta,
+ * sem headers de saldo: não há números honestos a dar); "closed" nega com
+ * 503. Bug de script Lua (LuaScriptFailureException) NUNCA é absorvido:
+ * propaga e falha alto, como todo defeito de código deve falhar.
  */
 final readonly class AdvancedRateLimiterMiddleware
 {
@@ -38,24 +44,30 @@ final readonly class AdvancedRateLimiterMiddleware
 
     private const string HEADER_RETRY = 'Retry-After';
 
+    // Retry-After sugerido no 503 de fail-closed: curto o bastante para o
+    // cliente voltar logo após um blip de Redis, longo o bastante para não
+    // transformar o incidente em martelo de retries.
+    private const int RETRY_AFTER_ON_FAILURE_SECONDS = 5;
+
     /**
-     * Recebe: o algoritmo e o resolvedor de chave via contratos (injetados
-     * pelo RateLimitingServiceProvider). Faz: guarda dependências.
-     * Retorna: instância imutável. Efeitos colaterais: nenhum.
+     * Recebe: a fábrica de algoritmos e o resolvedor de chave via contratos
+     * (injetados pelo RateLimitingServiceProvider). Faz: guarda
+     * dependências. Retorna: instância imutável. Efeitos colaterais: nenhum.
      */
     public function __construct(
-        private RateLimitAlgorithm $algorithm,
+        private RateLimitAlgorithmFactory $algorithmFactory,
         private RateLimitKeyResolver $keyResolver,
     ) {
     }
 
     /**
      * Recebe: requisição e próximo estágio do pipeline. Faz: quando o
-     * limitador está habilitado, resolve política e chave, consulta o
-     * algoritmo e (a) nega com 429 JSON + headers ou (b) deixa seguir e
-     * anexa os headers informativos à resposta. Retorna: a resposta HTTP.
-     * Efeitos colaterais: consumo de saldo no Redis via algoritmo; log de
-     * negações; propaga RedisUnavailableException (falha explícita).
+     * limitador está habilitado, resolve política e chave, seleciona o
+     * algoritmo declarado pela política e (a) nega com 429 JSON + headers,
+     * (b) deixa seguir e anexa os headers informativos, ou (c) aplica o
+     * failure_mode se o Redis estiver fora. Retorna: a resposta HTTP.
+     * Efeitos colaterais: consumo de saldo no Redis via algoritmo; logs de
+     * negação e de falha de infraestrutura.
      */
     public function handle(Request $request, Closure $next): Response
     {
@@ -66,11 +78,21 @@ final readonly class AdvancedRateLimiterMiddleware
         $policy = $this->policyForRequest($request);
         $resolvedKey = $this->keyResolver->resolve($request, $policy);
 
-        $rateLimitResult = $this->algorithm->attempt(
-            key: $resolvedKey,
-            policy: $policy,
-            cost: $policy->defaultCost,
-        );
+        // Seleção POR POLÍTICA: cada rota escolhe seu algoritmo na config.
+        $algorithm = $this->algorithmFactory->forAlgorithm($policy->algorithm);
+
+        try {
+            $rateLimitResult = $algorithm->attempt(
+                key: $resolvedKey,
+                policy: $policy,
+                cost: $policy->defaultCost,
+            );
+        } catch (RedisUnavailableException $failure) {
+            // Somente indisponibilidade de INFRAESTRUTURA cai aqui.
+            // LuaScriptFailureException e InvalidRateLimitPolicyException
+            // propagam: são bugs, não incidentes.
+            return $this->handleInfrastructureFailure($request, $next, $resolvedKey, $failure);
+        }
 
         if (! $rateLimitResult->allowed) {
             return $this->deniedResponse($rateLimitResult);
@@ -144,6 +166,55 @@ final readonly class AdvancedRateLimiterMiddleware
                 self::HEADER_LIMIT => (string) $rateLimitResult->limit,
                 self::HEADER_REMAINING => (string) $rateLimitResult->remaining,
                 self::HEADER_RETRY => (string) $rateLimitResult->retryAfter,
+            ],
+        );
+    }
+
+    /**
+     * Recebe: requisição, próximo estágio, chave em decisão e a falha de
+     * infraestrutura. Faz: aplica o failure_mode da config — "open" registra
+     * alerta e deixa a requisição seguir SEM contagem e SEM headers de saldo
+     * (não há números honestos sem Redis); "closed" registra erro e nega com
+     * 503 + Retry-After. Valor de failure_mode desconhecido lança
+     * InvalidRateLimitPolicyException (config errada é bug, não incidente).
+     * Retorna: a resposta HTTP conforme o modo. Efeitos colaterais: logs.
+     */
+    private function handleInfrastructureFailure(
+        Request $request,
+        Closure $next,
+        string $resolvedKey,
+        RedisUnavailableException $failure,
+    ): Response {
+        $rawMode = (string) config('rate_limiting.failure_mode', '');
+
+        $failureMode = FailureMode::tryFrom($rawMode)
+            ?? throw InvalidRateLimitPolicyException::forReason(
+                "unknown failure_mode '{$rawMode}' — valid values: open, closed"
+            );
+
+        if ($failureMode === FailureMode::Open) {
+            Log::warning('Rate limiter Redis unavailable — failure_mode=open, letting request through UNCOUNTED.', [
+                'key' => $resolvedKey,
+                'error' => $failure->getMessage(),
+            ]);
+
+            return $next($request);
+        }
+
+        Log::error('Rate limiter Redis unavailable — failure_mode=closed, rejecting request.', [
+            'key' => $resolvedKey,
+            'error' => $failure->getMessage(),
+        ]);
+
+        return new JsonResponse(
+            data: [
+                'message' => 'Rate limiter unavailable. Request rejected by closed failure mode.',
+                'code' => 'RATE_LIMITER_UNAVAILABLE',
+                'retry_after' => self::RETRY_AFTER_ON_FAILURE_SECONDS,
+            ],
+            status: Response::HTTP_SERVICE_UNAVAILABLE,
+            headers: [
+                self::HEADER_RETRY => (string) self::RETRY_AFTER_ON_FAILURE_SECONDS,
             ],
         );
     }

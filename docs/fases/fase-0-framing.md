@@ -60,6 +60,12 @@ Status **429 Too Many Requests**, corpo JSON em inglês (código/API); comentár
 Nas Fases 0 e 1 a falha de Redis **propaga** (`RedisUnavailableException`). O middleware ainda
 **não** honra `failure_mode`; isso é fase futura.
 
+> **Atualização (Fase 2, 2026-07-30):** `failure_mode` passou a ser HONRADO pelo
+> `AdvancedRateLimiterMiddleware` — `open` deixa passar sem contagem (log de alerta, sem headers
+> de saldo) e `closed` nega com 503 + `Retry-After`. Aplica-se somente a
+> `RedisUnavailableException`; bug de script Lua (`LuaScriptFailureException`) continua propagando.
+> O parágrafo acima permanece como registro histórico da decisão original.
+
 ## Contratos de código (fechados nesta fase)
 
 - `RateLimitAlgorithm::attempt(string $key, RateLimitPolicy $policy, int $cost): RateLimitResult`
