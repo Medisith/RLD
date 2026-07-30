@@ -84,13 +84,18 @@ final readonly class NaiveRedisRateLimiter implements RateLimitAlgorithm
             // (Retry-After), não decisório.
             $remainingTtl = $this->redisClient->ttl($key);
 
+            // TTL -2 (chave expirou entre os comandos) ou -1 (sem TTL,
+            // fruto de outra corrida documentada abaixo): instrui a
+            // janela cheia por honestidade conservadora.
+            $secondsUntilWindowExpires = $remainingTtl > 0 ? $remainingTtl : $policy->windowSeconds;
+
             return RateLimitResult::denied(
                 policy: $policy,
                 key: $key,
-                // TTL -2 (chave expirou entre os comandos) ou -1 (sem TTL,
-                // fruto de outra corrida documentada abaixo): instrui a
-                // janela cheia por honestidade conservadora.
-                retryAfter: $remainingTtl > 0 ? $remainingTtl : $policy->windowSeconds,
+                retryAfter: $secondsUntilWindowExpires,
+                // Na janela fixa, "voltar ao repouso" e "valer a pena tentar
+                // de novo" são o MESMO instante: a expiração da janela.
+                resetAfter: $secondsUntilWindowExpires,
             );
         }
 
@@ -110,6 +115,8 @@ final readonly class NaiveRedisRateLimiter implements RateLimitAlgorithm
             );
 
             $consumedAfter = $cost;
+            // Janela recém-aberta: o reset (X-RateLimit-Reset) é a janela inteira.
+            $secondsUntilReset = $policy->windowSeconds;
         } else {
             // Chave já existia: INCRBY. O incremento em si é atômico no
             // Redis, mas a DECISÃO que o autorizou foi tomada sobre leitura
@@ -121,9 +128,13 @@ final readonly class NaiveRedisRateLimiter implements RateLimitAlgorithm
             // o INCRBY a recriou SEM TTL (contador eterno). O EXPIRE abaixo
             // remenda — em MAIS um comando separado, ele próprio sujeito a
             // corrida. A necessidade deste remendo é sintoma do desenho
-            // errado, não solução.
-            if ($this->redisClient->ttl($key) < 0) {
+            // errado, não solução. O TTL lido aqui também alimenta o
+            // X-RateLimit-Reset (leitura informativa, não decisória).
+            $secondsUntilReset = $this->redisClient->ttl($key);
+
+            if ($secondsUntilReset < 0) {
                 $this->redisClient->expire($key, $policy->windowSeconds);
+                $secondsUntilReset = $policy->windowSeconds;
             }
         }
 
@@ -131,6 +142,7 @@ final readonly class NaiveRedisRateLimiter implements RateLimitAlgorithm
             policy: $policy,
             key: $key,
             remaining: $policy->capacity - $consumedAfter,
+            resetAfter: $secondsUntilReset,
         );
     }
 }

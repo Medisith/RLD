@@ -44,6 +44,12 @@ final readonly class AdvancedRateLimiterMiddleware
 
     private const string HEADER_RETRY = 'Retry-After';
 
+    // Fase 4 — segundos (delta, como Retry-After) até o estado da chave
+    // voltar ao repouso: janela expirar (naive), balde encher (token_bucket)
+    // ou balde esvaziar (leaky_bucket). Delta em vez de epoch: consistente
+    // com Retry-After e imune a clock skew do relógio do cliente.
+    private const string HEADER_RESET = 'X-RateLimit-Reset';
+
     // Retry-After sugerido no 503 de fail-closed: curto o bastante para o
     // cliente voltar logo após um blip de Redis, longo o bastante para não
     // transformar o incidente em martelo de retries.
@@ -101,9 +107,10 @@ final readonly class AdvancedRateLimiterMiddleware
         $response = $next($request);
 
         // Também na resposta permitida o cliente enxerga seu saldo — contrato
-        // de produto definido na Fase 0.
+        // de produto definido na Fase 0 (Reset entregue na Fase 4).
         $response->headers->set(self::HEADER_LIMIT, (string) $rateLimitResult->limit);
         $response->headers->set(self::HEADER_REMAINING, (string) $rateLimitResult->remaining);
+        $response->headers->set(self::HEADER_RESET, (string) $rateLimitResult->resetAfter);
 
         return $response;
     }
@@ -166,6 +173,9 @@ final readonly class AdvancedRateLimiterMiddleware
                 self::HEADER_LIMIT => (string) $rateLimitResult->limit,
                 self::HEADER_REMAINING => (string) $rateLimitResult->remaining,
                 self::HEADER_RETRY => (string) $rateLimitResult->retryAfter,
+                // Reset >= Retry-After por invariante do RateLimitResult:
+                // "uma requisição volta a caber" nunca depois do repouso total.
+                self::HEADER_RESET => (string) $rateLimitResult->resetAfter,
             ],
         );
     }

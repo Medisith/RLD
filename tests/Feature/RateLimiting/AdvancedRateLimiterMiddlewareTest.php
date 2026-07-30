@@ -69,7 +69,9 @@ test('request under the limit returns 200 with remaining headers', function (): 
         ->assertOk()
         ->assertJsonPath('message', 'pong')
         ->assertHeader('X-RateLimit-Limit', (string) TEST_CAPACITY)
-        ->assertHeader('X-RateLimit-Remaining', (string) (TEST_CAPACITY - 1));
+        ->assertHeader('X-RateLimit-Remaining', (string) (TEST_CAPACITY - 1))
+        // Fase 4: janela recém-aberta no naive -> reset = janela inteira.
+        ->assertHeader('X-RateLimit-Reset', '60');
 });
 
 test('when capacity is exhausted, responds 429 with contract body and headers', function (): void {
@@ -91,6 +93,11 @@ test('when capacity is exhausted, responds 429 with contract body and headers', 
     expect((int) $deniedResponse->headers->get('Retry-After'))
         ->toBeGreaterThanOrEqual(1)
         ->toBeLessThanOrEqual(60);
+
+    // Fase 4: Reset presente também no 429 e nunca antes do Retry-After
+    // (na janela fixa do naive, os dois coincidem).
+    expect((int) $deniedResponse->headers->get('X-RateLimit-Reset'))
+        ->toBeGreaterThanOrEqual((int) $deniedResponse->headers->get('Retry-After'));
 
     expect($deniedResponse->json('message'))
         ->toContain('Rate limit exceeded');

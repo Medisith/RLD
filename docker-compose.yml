@@ -1,0 +1,24 @@
+# =========================================================================
+# Infra mínima de demonstração — SOMENTE o Redis (Fase 5).
+#
+# Decisão explícita: o PHP roda na máquina host (php artisan serve, provas,
+# testes); containerizar a aplicação está fora do escopo do portfólio. Este
+# Compose existe para quem não tem Redis local: `docker compose up -d` e o
+# projeto inteiro funciona com a config padrão (127.0.0.1:6379).
+#
+# Sem persistência de propósito (--save "" e appendonly no): estado de rate
+# limiting é efêmero por natureza; um restart do container equivale ao
+# cenário de failover que a reidratação EVALSHA da Fase 4 cobre.
+# =========================================================================
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: rate-limiter-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
