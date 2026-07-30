@@ -63,6 +63,39 @@ Regra prática (tabela completa em `docs/fases/fase-3-leaky-bucket.md`): **Token
 burst passar e limita a média — proteja o SEU produto com boa UX; **Leaky Bucket** nivela a
 saída em `leak_rate`/s — proteja downstream rígido (gateway de pagamento, SLA duro).
 
+Para comparar algoritmos sem editar código: `RATE_LIMIT_PING_ALGORITHM=leaky_bucket` no ambiente.
+
+## Quota por tenant (opcional, desligada por padrão)
+
+Ligada, cada requisição consome dois baldes — o do cliente e o compartilhado da organização:
+
+```bash
+RATE_LIMIT_TENANT_ENABLED=true
+RATE_LIMIT_TENANT_CAPACITY=200
+RATE_LIMIT_TENANT_REFILL_RATE=4.0
+```
+
+```bash
+curl -i -X POST http://localhost:8000/api/rate-limited/ping \
+     -H 'Accept: application/json' -H 'X-Tenant-Id: acme'
+# 429 quando a cota compartilhada acaba: {"code":"RATE_LIMIT_EXCEEDED","scope":"tenant",...}
+```
+
+O cliente é checado primeiro, de propósito: um cliente abusivo barrado no próprio balde nunca
+drena a cota do tenant. **O header não é fronteira de confiança** — só tem valor se um gateway
+confiável o injeta. Desenho, trade-offs e limites: `docs/fases/fase-9-tenant-quotas-and-runbook.md`.
+
+## Carga (k6)
+
+```bash
+k6 run -e ALGORITHM=token_bucket k6/rate_limit_burst.js   # exige app servida + Redis
+```
+
+Mede latência (p95), vazão e a curva permitidas/negadas vista pelo cliente. Não substitui a
+prova de concorrência: sob `php artisan serve` (single-worker) as requisições são serializadas.
+Roteiro e tabela de resultados reais em `docs/fases/fase-8-k6-load.md` (40 VUs × 200; p95
+dominado pela fila do serve, não pelo Lua).
+
 ## Operação (Fase 4)
 
 - **EVALSHA + reidratação automática:** toda decisão atômica envia só o SHA-1 (40 bytes) em vez
@@ -119,17 +152,20 @@ vereditos no log do job.
 ## Checklist de honestidade — o que isto ainda NÃO é
 
 - **Não é um pacote de produção:** observabilidade é a MÍNIMA (4 contadores + logs
-  estruturados — sem série temporal, tracing ou alertas), sem teste de carga (k6 — fora de
-  escopo por regra), sem Nginx/edge (fora de escopo), sem multi-tenant.
+  estruturados — sem série temporal, tracing ou alertas), sem Nginx/edge (fora de escopo).
+- **Carga k6 sob `artisan serve`:** números reais na fase 8; o p95 alto reflete fila
+  single-worker, não custo do limitador. Concorrência de verdade continua nas provas PHP.
+- **Quota por tenant é leve, não multi-tenant de verdade:** um limite igual para todos os
+  tenants, sem planos, hierarquia ou billing; o header `X-Tenant-Id` depende de um gateway
+  confiável para ter qualquer valor de segurança; os dois checks não são atômicos entre si
+  (vazamento de 1 token documentado na fase 9).
 - **Redis único, sem HA:** cluster/sentinel e as consequências para EVALSHA/TIME não são
   tratados; `failure_mode` cobre indisponibilidade, não split-brain.
 - **Chave por IP atrás de proxy exige `TRUSTED_PROXIES` correto:** o padrão seguro (nenhum
   proxy confiável) vira balde único atrás de LB até você configurar a lista — documentado na
   fase 6; cardinalidade de chaves sob flood distribuído é limitada pelos TTLs, não eliminada.
-- **Testes automatizados e CI:** escritos e prontos, porém `php artisan test` e a primeira
-  rodada do workflow estão PENDENTES DE EXECUÇÃO no ambiente desta entrega (Packagist
-  bloqueado — sem `vendor/`; Actions roda no GitHub). Toda a mecânica Redis (provas, EVALSHA,
-  NOSCRIPT, anonimização) FOI executada de verdade e está registrada nas docs com números reais.
+- **CI no GitHub Actions:** a suíte e as provas rodam no workflow (`.github/workflows/ci.yml`);
+  localmente `php artisan test` passou com Redis real (54 testes) nesta máquina.
 - **Feito, apesar do nome "futuro" em fases antigas:** `SCRIPT LOAD`/EVALSHA (Fase 4),
   `X-RateLimit-Reset` (Fase 4), `failure_mode` honrado (Fase 2).
 
@@ -146,6 +182,9 @@ vereditos no log do job.
 | [docs/fases/fase-5-portfolio-packaging.md](docs/fases/fase-5-portfolio-packaging.md) | Empacotamento, demo e checklist de honestidade |
 | [docs/fases/fase-6-observability-and-hardening.md](docs/fases/fase-6-observability-and-hardening.md) | Logs sem PII, métricas mínimas, TrustProxies, limites conhecidos |
 | [docs/fases/fase-7-portfolio-closure.md](docs/fases/fase-7-portfolio-closure.md) | CI com Redis service e o roteiro de avaliação em 5 minutos |
+| [docs/fases/fase-8-k6-load.md](docs/fases/fase-8-k6-load.md) | Carga com k6: script, comandos e o que a medição não prova |
+| [docs/fases/fase-9-tenant-quotas-and-runbook.md](docs/fases/fase-9-tenant-quotas-and-runbook.md) | Quota por tenant: desenho, dois checks vs script composto, limites |
+| [docs/runbook.md](docs/runbook.md) | Runbook operacional: Redis fora, spoofing, SCRIPT FLUSH, cliente bloqueado |
 
 ## Estrutura do domínio
 
@@ -160,6 +199,7 @@ app/RateLimiting/
 ├── Support/         RateLimitPolicy, RateLimitResult, enums,
 │                    RateLimitMetrics + KeyAnonymizer (observabilidade — Fase 6)
 ├── Resolvers/       DefaultKeyResolver (rate-limit:{strategy}:{identifier}:{routeName})
+│                    e TenantQuotaResolver (quota compartilhada — Fase 9)
 ├── Infrastructure/  LaravelRedisClient, NativeRedisClient, Concerns/ExecutesEvalSha
 ├── Http/            AdvancedRateLimiterMiddleware (alias "rate-limit.advanced")
 └── Exceptions/      falhas explícitas por categoria (política, infra, script Lua)

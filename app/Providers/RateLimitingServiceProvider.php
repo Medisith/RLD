@@ -12,6 +12,7 @@ use App\RateLimiting\Contracts\RateLimitScriptRunner;
 use App\RateLimiting\Exceptions\InvalidRateLimitPolicyException;
 use App\RateLimiting\Infrastructure\LaravelRedisClient;
 use App\RateLimiting\Resolvers\DefaultKeyResolver;
+use App\RateLimiting\Resolvers\TenantQuotaResolver;
 use App\RateLimiting\Support\AvailableAlgorithm;
 use App\RateLimiting\Support\KeyAnonymizer;
 use App\RateLimiting\Support\RateLimitMetrics;
@@ -83,6 +84,19 @@ class RateLimitingServiceProvider extends ServiceProvider
         $this->app->singleton(RateLimitKeyResolver::class, function (Application $app): RateLimitKeyResolver {
             return new DefaultKeyResolver(
                 keyPrefix: (string) $app->make('config')->get('rate_limiting.key_prefix', 'rate-limit'),
+            );
+        });
+
+        // Quota composta por tenant (Fase 9). NÃO é singleton: a config
+        // inteira é lida na construção, e os testes trocam
+        // rate_limiting.tenant.* em tempo de execução — memoizar aqui
+        // congelaria a flag e daria falso verde.
+        $this->app->bind(TenantQuotaResolver::class, function (Application $app): TenantQuotaResolver {
+            $config = $app->make('config');
+
+            return new TenantQuotaResolver(
+                globalConfig: (array) $config->get('rate_limiting', []),
+                keyPrefix: (string) $config->get('rate_limiting.key_prefix', 'rate-limit'),
             );
         });
 

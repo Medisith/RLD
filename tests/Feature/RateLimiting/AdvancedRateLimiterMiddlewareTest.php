@@ -141,12 +141,35 @@ test('route cost override consumes multiple units per request', function (): voi
 // failure_mode (honrado desde a Fase 2): os dois testes abaixo derrubam o
 // Redis DE VERDADE para este processo — reapontam a conexão para uma porta
 // morta e purgam a conexão memoizada do RedisManager — e verificam cada modo.
+//
+// O RedisManager do Laravel congela o array de config na construção;
+// config()->set('database.redis...') NÃO atualiza $manager->config. Por
+// isso o helper abaixo escreve a porta morta no estado interno e só então
+// faz purge — senão a reconexão continua em 6379 e o failure_mode nunca
+// dispara (falso verde / falso vermelho).
 // ---------------------------------------------------------------------------
+
+/**
+ * Recebe: porta TCP que não deve responder. Faz: atualiza a config
+ * congelada do RedisManager + a do repositório, e purga a conexão
+ * "default" para forçar reconnect na próxima operação. Retorna: void.
+ */
+function pointRedisAtDeadPort(int $port = 6390): void
+{
+    config()->set('database.redis.default.port', $port);
+
+    $manager = Redis::getFacadeRoot();
+    $property = new ReflectionProperty($manager, 'config');
+    $cached = $property->getValue($manager);
+    $cached['default']['port'] = $port;
+    $property->setValue($manager, $cached);
+
+    Redis::purge('default');
+}
 
 test('failure_mode open lets the request through uncounted when Redis is down', function (): void {
     config()->set('rate_limiting.failure_mode', 'open');
-    config()->set('database.redis.default.port', 6390); // porta morta
-    Redis::purge('default'); // força reconexão com a config quebrada
+    pointRedisAtDeadPort();
 
     $response = $this->postJson('/api/rate-limited/ping');
 
@@ -159,8 +182,7 @@ test('failure_mode open lets the request through uncounted when Redis is down', 
 
 test('failure_mode closed rejects with 503 when Redis is down', function (): void {
     config()->set('rate_limiting.failure_mode', 'closed');
-    config()->set('database.redis.default.port', 6390); // porta morta
-    Redis::purge('default'); // força reconexão com a config quebrada
+    pointRedisAtDeadPort();
 
     $response = $this->postJson('/api/rate-limited/ping');
 
