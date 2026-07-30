@@ -8,6 +8,7 @@ use App\RateLimiting\Contracts\RateLimitAlgorithm;
 use App\RateLimiting\Contracts\RateLimitScriptRunner;
 use App\RateLimiting\Exceptions\InvalidRateLimitPolicyException;
 use App\RateLimiting\Exceptions\LuaScriptFailureException;
+use App\RateLimiting\Redis\LuaScript;
 use App\RateLimiting\Support\RateLimitPolicy;
 use App\RateLimiting\Support\RateLimitResult;
 
@@ -31,33 +32,29 @@ final class LeakyBucketRateLimiter implements RateLimitAlgorithm
 {
     private const string SCRIPT_PATH = __DIR__.'/../Redis/scripts/leaky_bucket.lua';
 
-    // Fonte do script, carregada UMA vez na construção (falha cedo se o
-    // arquivo sumir) e reutilizada em toda decisão.
-    private readonly string $scriptSource;
+    // Script versionado (fonte + SHA-1), carregado UMA vez na construção
+    // (falha cedo se o arquivo sumir) — é o cache de processo do fluxo
+    // EVALSHA da Fase 4; o adaptador reidrata no servidor se necessário.
+    private readonly LuaScript $script;
 
     /**
-     * Recebe: a porta de execução atômica de scripts (EVAL). Faz: carrega o
-     * script Lua versionado do disco. Retorna: instância pronta. Efeitos
-     * colaterais: leitura de arquivo; lança LuaScriptFailureException se o
-     * script não existir ou não puder ser lido.
+     * Recebe: a porta de execução atômica de scripts (EVALSHA + fallback).
+     * Faz: carrega o script Lua versionado do disco e pré-computa o SHA-1.
+     * Retorna: instância pronta. Efeitos colaterais: leitura de arquivo;
+     * lança LuaScriptFailureException se o script não existir ou não puder
+     * ser lido.
      */
     public function __construct(
         private readonly RateLimitScriptRunner $scriptRunner,
     ) {
-        $source = @file_get_contents(self::SCRIPT_PATH);
-
-        if ($source === false || $source === '') {
-            throw LuaScriptFailureException::missingScript(self::SCRIPT_PATH);
-        }
-
-        $this->scriptSource = $source;
+        $this->script = LuaScript::fromFile(self::SCRIPT_PATH);
     }
 
     /**
      * Recebe: chave resolvida, política vigente (algorithm = leaky_bucket,
      * leak_rate validado na construção da política) e custo da requisição.
      * Faz: executa o script Lua atômico com [capacity, leak_rate, cost] e
-     * converte a resposta [allowed, remaining, retry_after] em
+     * converte a resposta [allowed, remaining, retry_after, reset_after] em
      * RateLimitResult. Retorna: o veredito. Efeitos colaterais: leitura e
      * escrita do nível do balde no Redis (dentro do script); lança
      * InvalidRateLimitPolicyException para custo < 1 ou política sem
@@ -80,34 +77,35 @@ final class LeakyBucketRateLimiter implements RateLimitAlgorithm
         }
 
         $reply = $this->scriptRunner->evalScript(
-            script: $this->scriptSource,
+            script: $this->script,
             keys: [$key],
             arguments: [$policy->capacity, $policy->leakRate, $cost],
         );
 
-        [$allowed, $remaining, $retryAfter] = $this->parseReply($key, $reply);
+        [$allowed, $remaining, $retryAfter, $resetAfter] = $this->parseReply($key, $reply);
 
         return $allowed
-            ? RateLimitResult::allowed($policy, $key, $remaining)
-            : RateLimitResult::denied($policy, $key, $retryAfter);
+            ? RateLimitResult::allowed($policy, $key, $remaining, $resetAfter)
+            : RateLimitResult::denied($policy, $key, $retryAfter, $resetAfter);
     }
 
     /**
-     * Recebe: chave em decisão e resposta bruta do EVAL. Faz: valida o
-     * contrato de retorno do script — array de 3 valores numéricos
-     * [allowed, remaining, retry_after]. Retorna: tupla tipada
-     * [bool, int, int]. Efeitos colaterais: nenhum; lança
+     * Recebe: chave em decisão e resposta bruta do script. Faz: valida o
+     * contrato de retorno — array de 4 valores numéricos
+     * [allowed, remaining, retry_after, reset_after]. Retorna: tupla tipada
+     * [bool, int, int, int]. Efeitos colaterais: nenhum; lança
      * LuaScriptFailureException para resposta malformada.
      *
-     * @return array{0: bool, 1: int, 2: int}
+     * @return array{0: bool, 1: int, 2: int, 3: int}
      */
     private function parseReply(string $key, mixed $reply): array
     {
-        if (! is_array($reply) || count($reply) < 3
-            || ! is_numeric($reply[0]) || ! is_numeric($reply[1]) || ! is_numeric($reply[2])) {
+        if (! is_array($reply) || count($reply) < 4
+            || ! is_numeric($reply[0]) || ! is_numeric($reply[1])
+            || ! is_numeric($reply[2]) || ! is_numeric($reply[3])) {
             throw LuaScriptFailureException::unexpectedReply($key, $reply);
         }
 
-        return [(int) $reply[0] === 1, (int) $reply[1], (int) $reply[2]];
+        return [(int) $reply[0] === 1, (int) $reply[1], (int) $reply[2], (int) $reply[3]];
     }
 }

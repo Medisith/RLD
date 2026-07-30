@@ -49,6 +49,7 @@ Status **429 Too Many Requests**, corpo JSON em inglês (código/API); comentár
 | `X-RateLimit-Limit` | 200 e 429 | Capacidade total da política na janela |
 | `X-RateLimit-Remaining` | 200 e 429 | Consumos restantes após esta decisão (0 quando negado) |
 | `Retry-After` | 429 | Segundos até valer a pena tentar de novo |
+| `X-RateLimit-Reset` | 200 e 429 | Segundos até o estado voltar ao repouso (entregue na Fase 4; delta, como Retry-After) |
 
 ### Política de falha (documentada, ainda não implementada)
 

@@ -79,6 +79,12 @@ test('burst consumes the whole capacity and then denies with honest retry instru
         ->and($denied->remaining)->toBe(0)
         ->and($denied->retryAfter)->toBeGreaterThanOrEqual(9)
         ->and($denied->retryAfter)->toBeLessThanOrEqual(10);
+
+    // Fase 4 — X-RateLimit-Reset: tempo até o balde ENCHER por completo
+    // (~ capacity/refill_rate = 3/0.1 = 30s), sempre >= retryAfter.
+    expect($denied->resetAfter)->toBeGreaterThanOrEqual($denied->retryAfter)
+        ->and($denied->resetAfter)->toBeGreaterThanOrEqual(29)
+        ->and($denied->resetAfter)->toBeLessThanOrEqual(30);
 });
 
 test('bucket refills over elapsed time and allows again', function (): void {
