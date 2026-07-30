@@ -19,10 +19,11 @@ use App\RateLimiting\Support\RateLimitResult;
  * a Fase 1 do exercício: demonstrar, com números reais, por que "ler no
  * Redis, decidir no PHP e escrever no Redis" NÃO funciona como rate limiter
  * distribuído. A prova empírica está em scripts/prove_race_condition.php e
- * os resultados em docs/fases/fase-1-race-condition.md. A versão correta
- * (Token Bucket atômico via script Lua) virá em fase futura e substituirá
- * esta implementação atrás do MESMO contrato RateLimitAlgorithm.
- * NÃO USE ESTA CLASSE EM PRODUÇÃO.
+ * os resultados em docs/fases/fase-1-race-condition.md. As versões corretas
+ * existem desde as Fases 2 e 3 (TokenBucketRateLimiter e
+ * LeakyBucketRateLimiter, atômicos via script Lua) atrás do MESMO contrato
+ * RateLimitAlgorithm; esta classe permanece no projeto apenas como artefato
+ * didático comparativo. NÃO USE ESTA CLASSE EM PRODUÇÃO.
  * ==========================================================================
  *
  * Responsabilidade: manter um contador de consumo por chave com TTL igual à

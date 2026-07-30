@@ -11,8 +11,10 @@ namespace App\RateLimiting\Contracts;
  * TTL, EXPIRE, DEL). A ausência proposital de qualquer operação composta ou
  * atômica aqui é parte do exercício da Fase 1: o algoritmo ingênuo só tem
  * acesso a comandos separados, e é exatamente isso que o torna vulnerável a
- * race condition. Scripts Lua/EVAL entrarão neste contrato (ou em um novo)
- * apenas na fase futura.
+ * race condition. A execução atômica de scripts (EVAL) vive num contrato
+ * SEPARADO desde a Fase 2 — RateLimitScriptRunner — precisamente para que
+ * este aqui continue sem nenhuma operação atômica composta e o buraco do
+ * naive permaneça demonstrável.
  *
  * A porta também desacopla o algoritmo do framework: em produção a
  * implementação usa a conexão Redis do Laravel; na prova de race o mesmo

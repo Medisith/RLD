@@ -7,11 +7,12 @@ declare(strict_types=1);
  *
  * Responsabilidade: única fonte de verdade das políticas de limitação.
  *
- * IMPORTANTE (escopo das Fases 0 e 1): apenas o algoritmo "naive" existe.
- * Ele é INTENCIONALMENTE vulnerável a race condition (check-then-act sem
- * atomicidade) e será substituído por Token Bucket atômico via Lua em fase
- * futura. "failure_mode" está reservado e ainda NÃO é honrado pelo middleware
- * (falha de Redis hoje é explícita — ver docs/fases/fase-0-framing.md).
+ * Estado das fases: "naive" (Fase 1) permanece no projeto como artefato
+ * didático — é INTENCIONALMENTE vulnerável a race condition e não deve ser
+ * usado em produção (prova em docs/fases/fase-1-race-condition.md).
+ * "token_bucket" (Fase 2) e "leaky_bucket" (Fase 3) são atômicos via script
+ * Lua e são as escolhas corretas. "failure_mode" é HONRADO pelo middleware
+ * desde a Fase 2.
  */
 
 return [
@@ -23,25 +24,39 @@ return [
     // Estratégia padrão de identificação do cliente: user | ip | user_or_ip.
     'key_strategy' => env('RATE_LIMIT_KEY_STRATEGY', 'user_or_ip'),
 
-    // Algoritmo padrão. Nesta entrega somente "naive" é aceito.
-    // Reservados para fases futuras (NÃO implementados de propósito):
-    // 'algorithm' => 'token_bucket',  // Fase 2 — atômico via script Lua
-    // 'algorithm' => 'leaky_bucket',  // Fase 3 — vazão constante
-    'algorithm' => env('RATE_LIMIT_ALGORITHM', 'naive'),
+    // Algoritmo padrão (global). Cada rota pode sobrescrever em 'policies'.
+    //   'naive'        -> Fase 1, check-then-act SEM atomicidade (didático)
+    //   'token_bucket' -> Fase 2, burst de 'capacity' + recarga 'refill_rate'/s
+    //   'leaky_bucket' -> Fase 3, vazão constante 'leak_rate'/s até 'capacity'
+    'algorithm' => env('RATE_LIMIT_ALGORITHM', 'token_bucket'),
 
-    // Quantidade máxima de consumos dentro da janela (limite exemplo: 50).
+    // Significado de 'capacity' por algoritmo:
+    //   naive        -> consumos máximos por janela fixa
+    //   token_bucket -> burst máximo admitido de uma vez
+    //   leaky_bucket -> volume máximo represado antes de negar
     'capacity' => (int) env('RATE_LIMIT_CAPACITY', 50),
 
-    // Tamanho da janela fixa / TTL da chave no Redis, em segundos.
+    // Janela fixa / TTL, em segundos. Usada APENAS pelo 'naive'; os
+    // algoritmos de balde derivam seus TTLs das taxas (higiene de chaves
+    // calculada dentro dos scripts Lua).
     'window_seconds' => (int) env('RATE_LIMIT_WINDOW_SECONDS', 60),
+
+    // Tokens recarregados por segundo — usado APENAS pelo 'token_bucket'.
+    // Com capacity=50 e refill_rate=1.0: burst de 50 e regime sustentado de
+    // 1 req/s (60/min), aproximando a política 50/60s das fases anteriores.
+    'refill_rate' => (float) env('RATE_LIMIT_REFILL_RATE', 1.0),
+
+    // Unidades drenadas por segundo — usado APENAS pelo 'leaky_bucket'.
+    'leak_rate' => (float) env('RATE_LIMIT_LEAK_RATE', 1.0),
 
     // Custo consumido por requisição quando a política não especifica outro.
     'default_cost' => (int) env('RATE_LIMIT_DEFAULT_COST', 1),
 
-    // RESERVADO (documentado na Fase 0, implementação futura):
-    //   'open'   -> se o Redis cair, deixa a requisição passar (prioriza disponibilidade)
-    //   'closed' -> se o Redis cair, nega com 503 (prioriza proteção do backend)
-    // Nas Fases 0 e 1 a falha de Redis é propagada de forma explícita.
+    // HONRADO pelo middleware desde a Fase 2 (aplicado quando o Redis está
+    // indisponível — RedisUnavailableException):
+    //   'open'   -> requisição passa SEM contagem (prioriza disponibilidade)
+    //   'closed' -> nega com 503 + Retry-After (prioriza proteção do backend)
+    // Bug de script Lua nunca é absorvido pelo fail-open: propaga e falha alto.
     'failure_mode' => env('RATE_LIMIT_FAILURE_MODE', 'closed'),
 
     // Prefixo raiz de toda chave gravada no Redis pelo limitador.
@@ -49,15 +64,20 @@ return [
     'key_prefix' => 'rate-limit',
 
     // Políticas por rota (indexadas pelo NOME da rota). Qualquer chave
-    // omitida herda o valor global acima.
+    // omitida herda o valor global acima. O 'algorithm' é selecionável POR
+    // ROTA: naive | token_bucket | leaky_bucket.
     'policies' => [
 
         'rate-limited.ping' => [
             'capacity' => 50,
-            'window_seconds' => 60,
             'default_cost' => 1,
             'key_strategy' => 'user_or_ip',
-            'algorithm' => 'naive',
+            'algorithm' => 'token_bucket',
+            'refill_rate' => 1.0,
+
+            // Alternativas de demonstração (trocar 'algorithm' acima):
+            //   'algorithm' => 'leaky_bucket', 'leak_rate' => 1.0,
+            //   'algorithm' => 'naive', 'window_seconds' => 60,  // reproduz a Fase 1
         ],
 
     ],

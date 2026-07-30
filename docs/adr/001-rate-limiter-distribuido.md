@@ -92,3 +92,35 @@ Explicitamente fora desta entrega (fases futuras): script Lua e Token Bucket at�
 Bucket; implementação do `failure_mode` aberto/fechado; headers adicionais (`X-RateLimit-Reset`);
 métricas e carga com k6; Docker Compose e Nginx; qualquer refatoração fora do domínio do
 limitador.
+
+## Adendo (2026-07-30) — Fases 2 e 3 entregues
+
+As seções acima permanecem como registro histórico da decisão original; nada foi apagado. Este
+adendo registra o que mudou de status com a entrega das Fases 2 e 3.
+
+**Decisão principal confirmada na prática.** A atomicidade via script Lua, prevista no item 2 da
+Decisão, foi implementada (`app/RateLimiting/Redis/scripts/token_bucket.lua` e
+`leaky_bucket.lua`, executados por `EVAL`) e validada empiricamente: 200 tentativas concorrentes
+contra capacidade 50 admitiram exatamente 50 em todas as rodadas, nos dois algoritmos — contra
+73–95 admissões do naive na mesma bateria (evidência em `docs/fases/fase-2-token-bucket.md` e
+`fase-3-leaky-bucket.md`).
+
+**Nova porta de infraestrutura.** O `EVAL` entrou em um contrato SEPARADO
+(`RateLimitScriptRunner`) em vez de ampliar `RateLimitRedisClient`. Racional: manter o contrato
+do naive estruturalmente incapaz de atomicidade composta preserva o artefato didático da Fase 1 e
+impede, por construção, um algoritmo "híbrido" meio atômico. Os adaptadores concretos
+(`LaravelRedisClient`, `NativeRedisClient`) implementam as duas portas sobre a mesma conexão.
+
+**Relógio.** Os scripts usam `TIME` do próprio Redis (não o relógio do PHP): N instâncias de
+aplicação com clock skew enxergam a mesma linha do tempo. `TIME` em script é seguro no
+Redis >= 5 (replicação por efeitos) e é chamado antes de qualquer escrita.
+
+**Consequência revisada — failure_mode.** A consequência negativa "cai o Redis, cai a capacidade
+de decidir" foi mitigada: o middleware passou a honrar `failure_mode` (`open` = passa sem
+contagem; `closed` = 503). Bug de script Lua nunca é absorvido pelo fail-open — propaga como todo
+defeito de código deve propagar.
+
+**Seleção por rota.** `AvailableAlgorithm` fechou com três casos (`naive`, `token_bucket`,
+`leaky_bucket`), selecionáveis globalmente e por política de rota via
+`RateLimitAlgorithmFactory` (match exaustivo). O naive permanece no projeto exclusivamente como
+artefato didático comparativo — a advertência de não usar em produção continua em vigor.
