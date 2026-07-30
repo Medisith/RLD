@@ -1,136 +1,83 @@
-# Rate Limiter Distribuído — Portfólio (Fases 0 a 3)
+# Rate Limiter Distribuído — Laravel + Redis + Lua
 
-Rate limiter distribuído customizado em Laravel 12, construído **sem** o rate limiter nativo do
-framework (nenhum uso de `RateLimiter`, `ThrottleRequests`, facade `RateLimiter` ou middleware
-`throttle`). Estado compartilhado em Redis; estrutura e identificadores em inglês; comentários em português.
+Rate limiter distribuído construído do zero em Laravel 12, **sem** o rate limiter nativo do
+framework (`RateLimiter`, `ThrottleRequests`, `throttle` — zero uso). Primeiro a versão errada,
+provada errada com números; depois as versões corretas, provadas corretas com os mesmos números.
 
-**Estado atual:** três algoritmos convivem atrás do mesmo contrato `RateLimitAlgorithm`,
-selecionáveis por config (global e por rota):
+## O problema, em uma frase
 
-| Algoritmo | Fase | Status | Prova empírica (200 tentativas concorrentes, capacidade 50) |
+"Ler o contador no Redis, decidir no PHP, escrever de volta" parece funcionar — até duas
+requisições concorrentes lerem o MESMO valor e ambas se admitirem. Sob rajada, o limite deixa de
+ser um limite exatamente quando mais importa.
+
+## A prova (números reais, medidos por `scripts/prove_race_condition.php`)
+
+200 tentativas concorrentes (40 processos × 5) contra capacidade 50, PHP 8.4 + Redis 7:
+
+| Algoritmo | Fase | Como decide | Admitidas de 200 (esperado: 50) |
 |---|---|---|---|
-| `naive` | 1 | **Didático — NÃO usar em produção.** Check-then-act sem atomicidade | 73–95 admitidas (+46% a +90% de sobre-admissão) |
-| `token_bucket` | 2 | Correto. Burst + recarga contínua, atômico via Lua | exatamente 50 em todas as rodadas |
-| `leaky_bucket` | 3 | Correto. Vazão constante, atômico via Lua | exatamente 50 em todas as rodadas |
+| `naive` | 1 | GET → decide no PHP → SET/INCR (didático, **NÃO usar**) | **73–95** (+46% a +90%) |
+| `token_bucket` | 2 | Script Lua atômico via EVALSHA — burst + recarga | **exatamente 50** |
+| `leaky_bucket` | 3 | Script Lua atômico via EVALSHA — vazão constante | **exatamente 50** |
 
-## Documentação
+O naive fica no projeto de propósito, como artefato didático comparativo. Registros completos:
+`docs/fases/fase-1` a `fase-4`.
 
-| Documento | Conteúdo |
-|---|---|
-| [docs/adr/001-rate-limiter-distribuido.md](docs/adr/001-rate-limiter-distribuido.md) | Decisão arquitetural + adendo das Fases 2 e 3 |
-| [docs/fases/fase-0-framing.md](docs/fases/fase-0-framing.md) | Contratos de produto e de código, política de falha, glossário |
-| [docs/fases/fase-1-race-condition.md](docs/fases/fase-1-race-condition.md) | O defeito check-then-act, como reproduzir e os resultados reais medidos |
-| [docs/fases/fase-2-token-bucket.md](docs/fases/fase-2-token-bucket.md) | Semântica do Token Bucket, por que Lua, prova corrigida, contraste com o naive |
-| [docs/fases/fase-3-leaky-bucket.md](docs/fases/fase-3-leaky-bucket.md) | Semântica do Leaky Bucket, prova e comparativo Token vs Leaky (quando usar cada um) |
-
-## Estrutura do domínio
-
-```
-app/RateLimiting/
-├── Contracts/       RateLimitAlgorithm, RateLimitKeyResolver,
-│                    RateLimitRedisClient (comandos individuais — porta do naive),
-│                    RateLimitScriptRunner (EVAL atômico — porta dos buckets)
-├── Support/         RateLimitPolicy, RateLimitResult, enums (KeyStrategy,
-│                    AvailableAlgorithm, FailureMode)
-├── Algorithms/      NaiveRedisRateLimiter (INSEGURO de propósito — Fase 1),
-│                    TokenBucketRateLimiter (Fase 2), LeakyBucketRateLimiter (Fase 3),
-│                    RateLimitAlgorithmFactory (seleção por política)
-├── Redis/scripts/   token_bucket.lua, leaky_bucket.lua (versionados, executados por EVAL)
-├── Resolvers/       DefaultKeyResolver (chave rate-limit:{strategy}:{identifier}:{routeName})
-├── Infrastructure/  LaravelRedisClient (produção) e NativeRedisClient (provas standalone)
-├── Http/            AdvancedRateLimiterMiddleware (alias "rate-limit.advanced")
-└── Exceptions/      RateLimitException, InvalidRateLimitPolicyException,
-                     RedisUnavailableException, LuaScriptFailureException
-```
-
-Config de negócio: `config/rate_limiting.php`. Rota de teste: `POST /api/rate-limited/ping`
-(política padrão: `token_bucket`, capacity 50, refill_rate 1.0/s).
-
-## Escolhendo o algoritmo
-
-Global (padrão para rotas sem política própria) — `.env` ou `config/rate_limiting.php`:
+## Rodar em 3 comandos
 
 ```bash
-RATE_LIMIT_ALGORITHM=token_bucket   # naive | token_bucket | leaky_bucket
-RATE_LIMIT_CAPACITY=50
-RATE_LIMIT_REFILL_RATE=1.0          # token_bucket: tokens/segundo
-RATE_LIMIT_LEAK_RATE=1.0            # leaky_bucket: drenagem/segundo
-RATE_LIMIT_FAILURE_MODE=closed      # open | closed (honrado pelo middleware)
+docker compose up -d      # sobe SÓ o Redis (ou use um Redis local seu)
+./scripts/demo.sh         # roda as três provas e imprime o contraste (Windows: scripts/demo.ps1)
 ```
 
-Por rota — `config/rate_limiting.php`:
+A demo não exige `composer install` — o script de prova carrega os mesmos algoritmos do
+middleware por autoloader próprio. Para a aplicação HTTP completa:
+
+```bash
+cp .env.example .env && composer install && php artisan key:generate
+php artisan serve --port=8000
+
+curl -i -X POST http://localhost:8000/api/rate-limited/ping -H 'Accept: application/json'
+# 200 + X-RateLimit-Limit: 50 | X-RateLimit-Remaining: 49 | X-RateLimit-Reset: 50
+# esgotado o balde: 429 + Retry-After + X-RateLimit-Reset (code RATE_LIMIT_EXCEEDED)
+```
+
+## Escolhendo o algoritmo (global e por rota)
 
 ```php
+// config/rate_limiting.php — cada rota escolhe seu algoritmo
 'policies' => [
     'rate-limited.ping' => [
         'capacity' => 50,
         'algorithm' => 'token_bucket', 'refill_rate' => 1.0,
         // ou: 'algorithm' => 'leaky_bucket', 'leak_rate' => 1.0,
-        // ou: 'algorithm' => 'naive', 'window_seconds' => 60,  // didático — reproduz a Fase 1
+        // ou: 'algorithm' => 'naive', 'window_seconds' => 60,  // reproduz a Fase 1
     ],
 ],
 ```
 
-Resumo do comparativo (tabela completa na fase 3): Token Bucket deixa o burst passar e limita a
-média — bom para proteger o SEU produto com boa UX; Leaky Bucket nivela a saída em `leak_rate`/s
-— bom para proteger downstream rígido (gateway de pagamento, integração com SLA duro).
+Regra prática (tabela completa em `docs/fases/fase-3-leaky-bucket.md`): **Token Bucket** deixa o
+burst passar e limita a média — proteja o SEU produto com boa UX; **Leaky Bucket** nivela a
+saída em `leak_rate`/s — proteja downstream rígido (gateway de pagamento, SLA duro).
 
-## Requisitos
+## Operação (Fase 4)
 
-PHP >= 8.2 com extensões `redis` (obrigatória) e `pcntl` (para as provas), Composer, Redis 6+
-acessível (os scripts Lua usam `TIME` no servidor; qualquer Redis >= 5 atende). Sem banco
-relacional: o sqlite em memória só satisfaz o boot do framework.
-
-## Instalação
-
-```bash
-cp .env.example .env        # ajuste REDIS_HOST/REDIS_PORT se preciso
-composer install
-php artisan key:generate
-```
-
-Suba um Redis local (qualquer forma serve; exemplo sem persistência):
+- **EVALSHA + reidratação automática:** toda decisão atômica envia só o SHA-1 (40 bytes) em vez
+  do fonte Lua (~4 KB). Em `NOSCRIPT` (restart/failover/`SCRIPT FLUSH`), o adaptador recarrega o
+  `.lua` versionado via `SCRIPT LOAD`, confere o SHA e repete — transparente, provado com
+  `SCRIPT FLUSH` real no meio da operação. Nenhuma ação extra de deploy.
+- **Headers:** `X-RateLimit-Limit`, `X-RateLimit-Remaining` e `X-RateLimit-Reset` no 200 e no
+  429; `Retry-After` no 429. `Reset` é delta em segundos (consistente com `Retry-After`) até o
+  estado voltar ao repouso — janela expirar, balde encher ou balde drenar.
+- **failure_mode honrado:** Redis fora → `open` deixa passar sem contagem (log de alerta) ou
+  `closed` nega com 503. Bug de script Lua nunca é absorvido: propaga.
+- **Comandos Artisan:**
 
 ```bash
-redis-server --daemonize yes --port 6379 --save '' --appendonly no
+php artisan rate-limit:inspect "rate-limit:ip:203.0.113.10:rate-limited.ping"   # estado bruto (read-only)
+php artisan rate-limit:reset   "rate-limit:ip:203.0.113.10:rate-limited.ping"   # volta ao repouso
+php artisan rate-limit:dry-run rate-limited.ping --identifier=203.0.113.10      # política efetiva, sem consumir
 ```
-
-## Validar manualmente uma requisição
-
-```bash
-php artisan serve --port=8000
-
-curl -i -X POST http://localhost:8000/api/rate-limited/ping -H 'Accept: application/json'
-# HTTP/1.1 200 — body {"message":"pong",...}
-# X-RateLimit-Limit: 50
-# X-RateLimit-Remaining: 49
-```
-
-Esgotado o balde, a resposta vira `429` com corpo JSON (`code: RATE_LIMIT_EXCEEDED`) e headers
-`X-RateLimit-Limit`, `X-RateLimit-Remaining: 0` e `Retry-After` calculado da taxa da política.
-Com o Redis fora do ar: `failure_mode=open` deixa passar sem contagem; `closed` responde 503
-(`code: RATE_LIMITER_UNAVAILABLE`).
-
-## Provas de concorrência (naive vs token vs leaky)
-
-Não exigem a aplicação de pé nem `vendor/` — o script carrega os mesmos algoritmos do middleware
-via autoloader próprio e dispara processos concorrentes contra o Redis:
-
-```bash
-# Fase 1 — o defeito: espere sobre-admissão (+46% a +90% nas execuções registradas)
-php scripts/prove_race_condition.php --algorithm=naive --processes=40 --attempts=5 --rounds=3
-
-# Fase 2 — a correção: espere exatamente capacity admitidas (50)
-php scripts/prove_race_condition.php --algorithm=token_bucket --refill-rate=1 --processes=40 --attempts=5 --rounds=3
-
-# Fase 3 — vazão constante, mesma atomicidade: espere exatamente capacity admitidas (50)
-php scripts/prove_race_condition.php --algorithm=leaky_bucket --leak-rate=1 --processes=40 --attempts=5 --rounds=3
-```
-
-Variante fim a fim via HTTP (exige `composer install` e `php artisan serve`): adicione
-`--mode=http --url=http://localhost:8000/api/rate-limited/ping` — o algoritmo, nesse modo, é o
-que a config define para a rota. Resultados registrados e leitura dos números:
-docs/fases/fase-1, fase-2 e fase-3.
 
 ## Testes
 
@@ -138,14 +85,54 @@ docs/fases/fase-1, fase-2 e fase-3.
 php artisan test
 ```
 
-Os testes de feature exigem Redis real (banco 15) e são pulados com aviso quando ele não está
-disponível. Cobrem: contrato HTTP (200/429/headers), semântica dos três algoritmos (burst,
-recarga, represamento, drenagem), invariantes de política e os dois modos de `failure_mode`
-(derrubando a conexão de verdade). Atenção: testes são sequenciais e **não** provam atomicidade
-sob concorrência — isso é papel exclusivo do script de provas.
+Exigem Redis real (banco 15; pulados com aviso se ausente). Cobrem contrato HTTP, semântica dos
+três algoritmos, invariantes de política e de resultado, failure_mode com conexão derrubada de
+verdade, reidratação pós-`SCRIPT FLUSH` e os comandos de operação. Testes são sequenciais e não
+provam atomicidade — isso é papel exclusivo do script de provas.
 
-## Escopo fechado desta entrega
+## Checklist de honestidade — o que isto ainda NÃO é
 
-Fora de escopo, de propósito, até aqui: métricas e carga com k6; Docker Compose; Nginx; headers
-adicionais (`X-RateLimit-Reset`); `EVALSHA`/`SCRIPT LOAD` como otimização de banda (hoje cada
-decisão envia o fonte do script via `EVAL` — correto, porém otimizável em fase futura).
+- **Não é um pacote de produção:** sem observabilidade (métricas/tracing), sem teste de carga
+  (k6 — fora de escopo por regra), sem Nginx/edge (fora de escopo), sem multi-tenant.
+- **Redis único, sem HA:** cluster/sentinel e as consequências para EVALSHA/TIME não são
+  tratados; `failure_mode` cobre indisponibilidade, não split-brain.
+- **Chave por IP pressupõe IP real:** atrás de proxy/CDN exige trusted proxies configurado —
+  não incluído.
+- **Testes automatizados:** escritos, porém a execução do `php artisan test` está PENDENTE DE
+  EXECUÇÃO no ambiente desta entrega (Packagist bloqueado — sem `vendor/`); rode localmente.
+  Toda a mecânica Redis (provas, EVALSHA, NOSCRIPT) FOI executada de verdade e está registrada
+  nas docs com números reais.
+- **Feito, apesar do nome "futuro" em fases antigas:** `SCRIPT LOAD`/EVALSHA (Fase 4),
+  `X-RateLimit-Reset` (Fase 4), `failure_mode` honrado (Fase 2).
+
+## Documentação por fase
+
+| Documento | Conteúdo |
+|---|---|
+| [docs/adr/001-rate-limiter-distribuido.md](docs/adr/001-rate-limiter-distribuido.md) | Decisão arquitetural + adendos |
+| [docs/fases/fase-0-framing.md](docs/fases/fase-0-framing.md) | Contratos de produto/código, política de falha, glossário |
+| [docs/fases/fase-1-race-condition.md](docs/fases/fase-1-race-condition.md) | O defeito check-then-act e a prova com números |
+| [docs/fases/fase-2-token-bucket.md](docs/fases/fase-2-token-bucket.md) | Token Bucket, por que Lua, prova corrigida |
+| [docs/fases/fase-3-leaky-bucket.md](docs/fases/fase-3-leaky-bucket.md) | Leaky Bucket e comparativo Token vs Leaky |
+| [docs/fases/fase-4-evalsha-and-ops.md](docs/fases/fase-4-evalsha-and-ops.md) | EVAL vs EVALSHA, X-RateLimit-Reset, comandos de ops |
+| [docs/fases/fase-5-portfolio-packaging.md](docs/fases/fase-5-portfolio-packaging.md) | Empacotamento, demo e checklist de honestidade |
+
+## Estrutura do domínio
+
+```
+app/RateLimiting/
+├── Contracts/       RateLimitAlgorithm, RateLimitKeyResolver,
+│                    RateLimitRedisClient (porta do naive — comandos individuais),
+│                    RateLimitScriptRunner (porta dos buckets — EVALSHA atômico)
+├── Algorithms/      NaiveRedisRateLimiter, TokenBucketRateLimiter,
+│                    LeakyBucketRateLimiter, RateLimitAlgorithmFactory
+├── Redis/           LuaScript (fonte + SHA-1) e scripts/*.lua (fonte de verdade)
+├── Support/         RateLimitPolicy, RateLimitResult, enums
+├── Resolvers/       DefaultKeyResolver (rate-limit:{strategy}:{identifier}:{routeName})
+├── Infrastructure/  LaravelRedisClient, NativeRedisClient, Concerns/ExecutesEvalSha
+├── Http/            AdvancedRateLimiterMiddleware (alias "rate-limit.advanced")
+└── Exceptions/      falhas explícitas por categoria (política, infra, script Lua)
+```
+
+Requisitos: PHP >= 8.2 (`ext-redis`; `ext-pcntl` para as provas), Redis >= 5 (scripts usam
+`TIME`), Composer. Sem banco relacional — sqlite em memória só para o boot do framework.
