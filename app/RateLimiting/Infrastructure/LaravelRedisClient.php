@@ -6,9 +6,10 @@ namespace App\RateLimiting\Infrastructure;
 
 use App\RateLimiting\Contracts\RateLimitRedisClient;
 use App\RateLimiting\Contracts\RateLimitScriptRunner;
-use App\RateLimiting\Exceptions\LuaScriptFailureException;
 use App\RateLimiting\Exceptions\RateLimitException;
 use App\RateLimiting\Exceptions\RedisUnavailableException;
+use App\RateLimiting\Infrastructure\Concerns\ExecutesEvalSha;
+use App\RateLimiting\Redis\LuaScript;
 use Illuminate\Contracts\Redis\Factory as RedisFactory;
 use Throwable;
 
@@ -26,6 +27,8 @@ use Throwable;
  */
 final readonly class LaravelRedisClient implements RateLimitRedisClient, RateLimitScriptRunner
 {
+    use ExecutesEvalSha;
+
     /**
      * Recebe: a fábrica de conexões Redis do framework. Faz: guarda a
      * dependência. Retorna: instância imutável. Efeitos colaterais: nenhum
@@ -71,35 +74,28 @@ final readonly class LaravelRedisClient implements RateLimitRedisClient, RateLim
     }
 
     /**
-     * Recebe: código Lua, KEYS e ARGV. Faz: EVAL na conexão do framework
-     * (execução atômica no servidor). Retorna: resposta bruta do Redis.
-     * Efeitos colaterais: os do script; lança RedisUnavailableException em
-     * falha de infraestrutura e LuaScriptFailureException quando o servidor
-     * reporta erro de script (phpredis devolve false e registra o erro em
-     * getLastError() em vez de lançar — a checagem explícita abaixo impede
-     * que um bug de Lua vire um "negado" silencioso).
+     * Recebe: o script (fonte + SHA-1 pré-computado), KEYS e ARGV. Faz:
+     * EVALSHA na conexão do framework, com reidratação automática via
+     * SCRIPT LOAD quando o servidor responde NOSCRIPT (rotina compartilhada
+     * ExecutesEvalSha — Fase 4). Retorna: resposta bruta do Redis. Efeitos
+     * colaterais: os do script; lança RedisUnavailableException em falha de
+     * infraestrutura e LuaScriptFailureException para erro de script, SHA
+     * divergente ou NOSCRIPT persistente.
      *
      * @param  list<string>  $keys
      * @param  list<int|float|string>  $arguments
      */
-    public function evalScript(string $script, array $keys, array $arguments): mixed
+    public function evalScript(LuaScript $script, array $keys, array $arguments): mixed
     {
         return $this->run(function () use ($script, $keys, $arguments): mixed {
-            $connection = $this->connection();
-
-            $reply = $connection->eval($script, count($keys), ...$keys, ...$arguments);
-
-            if ($reply === false) {
-                $serverError = $connection->client()->getLastError();
-
-                if ($serverError !== null) {
-                    $connection->client()->clearLastError();
-
-                    throw LuaScriptFailureException::serverError($serverError);
-                }
-            }
-
-            return $reply;
+            // client() expõe o phpredis cru: EVALSHA/SCRIPT LOAD com
+            // tratamento de getLastError() idêntico nos dois adaptadores.
+            return $this->runEvalShaOnClient(
+                client: $this->connection()->client(),
+                script: $script,
+                keys: $keys,
+                arguments: $arguments,
+            );
         });
     }
 

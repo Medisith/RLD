@@ -31,11 +31,15 @@
 --   ARGV[2] = leak_rate (float > 0, unidades/segundo)
 --   ARGV[3] = cost (int > 0)
 --
--- Saída (array de 3 inteiros, floors/ceils explícitos):
+-- Saída (array de 4 inteiros, floors/ceils explícitos):
 --   [1] allowed      -> 1 permitido, 0 negado
 --   [2] remaining    -> floor(capacidade livre restante) para X-RateLimit-Remaining
 --   [3] retry_after  -> 0 se permitido; senão ceil(segundos até drenar o
 --                       suficiente para "cost" caber)
+--   [4] reset_after  -> ceil(segundos até o balde drenar por COMPLETO), para
+--                       X-RateLimit-Reset (Fase 4). Sempre >= retry_after:
+--                       retry diz quando UMA requisição volta a caber;
+--                       reset diz quando o estado volta ao repouso total.
 -- =========================================================================
 
 local bucket_key = KEYS[1]
@@ -79,7 +83,9 @@ redis.call('HSET', bucket_key, 'level', tostring(level), 'last_leak_ms', now_ms)
 
 -- TTL de higiene: a chave só precisa viver até o balde drenar por completo
 -- (balde vazio é indistinguível de chave ausente). +1s de margem.
-local seconds_until_empty = math.ceil(level / leak_rate)
+-- O MESMO cálculo alimenta o reset_after do header X-RateLimit-Reset:
+-- uma única definição de "voltar ao repouso" para TTL e para o cliente.
+local seconds_until_empty = math.max(0, math.ceil(level / leak_rate))
 redis.call('EXPIRE', bucket_key, math.max(1, seconds_until_empty + 1))
 
-return { allowed, math.floor(capacity - level), retry_after }
+return { allowed, math.floor(capacity - level), retry_after, seconds_until_empty }

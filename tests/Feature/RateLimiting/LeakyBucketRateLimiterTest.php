@@ -79,6 +79,12 @@ test('bucket fills up to capacity and then denies with drain instruction', funct
         ->and($denied->remaining)->toBe(0)
         ->and($denied->retryAfter)->toBeGreaterThanOrEqual(9)
         ->and($denied->retryAfter)->toBeLessThanOrEqual(10);
+
+    // Fase 4 — X-RateLimit-Reset: tempo até o balde DRENAR por completo
+    // (~ level/leak_rate = 3/0.1 = 30s), sempre >= retryAfter.
+    expect($denied->resetAfter)->toBeGreaterThanOrEqual($denied->retryAfter)
+        ->and($denied->resetAfter)->toBeGreaterThanOrEqual(29)
+        ->and($denied->resetAfter)->toBeLessThanOrEqual(30);
 });
 
 test('bucket drains at constant rate and accepts again', function (): void {

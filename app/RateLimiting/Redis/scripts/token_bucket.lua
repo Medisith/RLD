@@ -28,12 +28,16 @@
 --   ARGV[2] = refill_rate (float > 0, tokens/segundo)
 --   ARGV[3] = cost (int > 0)
 --
--- Saída (array de 3 inteiros — Lua->Redis trunca floats, então os floors e
+-- Saída (array de 4 inteiros — Lua->Redis trunca floats, então os floors e
 -- ceils são EXPLÍCITOS aqui, nunca implícitos):
 --   [1] allowed      -> 1 permitido, 0 negado
 --   [2] remaining    -> floor(tokens restantes) para X-RateLimit-Remaining
 --   [3] retry_after  -> 0 se permitido; senão ceil(segundos até acumular
 --                       tokens suficientes para "cost")
+--   [4] reset_after  -> ceil(segundos até o balde estar CHEIO de novo), para
+--                       X-RateLimit-Reset (Fase 4). Sempre >= retry_after:
+--                       retry diz quando UMA requisição volta a caber;
+--                       reset diz quando o estado volta ao repouso total.
 -- =========================================================================
 
 local bucket_key = KEYS[1]
@@ -82,7 +86,9 @@ redis.call('HSET', bucket_key, 'tokens', tostring(tokens), 'last_refill_ms', now
 -- TTL de higiene: a chave só precisa viver até o balde estar cheio de novo
 -- (balde cheio é indistinguível de chave ausente). +1s de margem contra
 -- arredondamento. Evita chaves eternas para clientes que nunca voltam.
-local seconds_until_full = math.ceil((capacity - tokens) / refill_rate)
+-- O MESMO cálculo alimenta o reset_after do header X-RateLimit-Reset:
+-- uma única definição de "voltar ao repouso" para TTL e para o cliente.
+local seconds_until_full = math.max(0, math.ceil((capacity - tokens) / refill_rate))
 redis.call('EXPIRE', bucket_key, math.max(1, seconds_until_full + 1))
 
-return { allowed, math.floor(tokens), retry_after }
+return { allowed, math.floor(tokens), retry_after, seconds_until_full }

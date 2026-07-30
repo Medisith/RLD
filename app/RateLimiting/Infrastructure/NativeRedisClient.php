@@ -6,9 +6,10 @@ namespace App\RateLimiting\Infrastructure;
 
 use App\RateLimiting\Contracts\RateLimitRedisClient;
 use App\RateLimiting\Contracts\RateLimitScriptRunner;
-use App\RateLimiting\Exceptions\LuaScriptFailureException;
 use App\RateLimiting\Exceptions\RateLimitException;
 use App\RateLimiting\Exceptions\RedisUnavailableException;
+use App\RateLimiting\Infrastructure\Concerns\ExecutesEvalSha;
+use App\RateLimiting\Redis\LuaScript;
 use Redis;
 use Throwable;
 
@@ -26,6 +27,8 @@ use Throwable;
  */
 final class NativeRedisClient implements RateLimitRedisClient, RateLimitScriptRunner
 {
+    use ExecutesEvalSha;
+
     private Redis $connection;
 
     /**
@@ -91,35 +94,25 @@ final class NativeRedisClient implements RateLimitRedisClient, RateLimitScriptRu
     }
 
     /**
-     * Recebe: código Lua, KEYS e ARGV. Faz: EVAL via phpredis (execução
-     * atômica no servidor). Retorna: resposta bruta do Redis. Efeitos
+     * Recebe: o script (fonte + SHA-1 pré-computado), KEYS e ARGV. Faz:
+     * EVALSHA via phpredis, com reidratação automática via SCRIPT LOAD
+     * quando o servidor responde NOSCRIPT (rotina compartilhada
+     * ExecutesEvalSha — Fase 4). Retorna: resposta bruta do Redis. Efeitos
      * colaterais: os do script; lança RedisUnavailableException em falha de
-     * infraestrutura e LuaScriptFailureException quando o servidor reporta
-     * erro de script (phpredis devolve false e registra o erro em
-     * getLastError() em vez de lançar).
+     * infraestrutura e LuaScriptFailureException para erro de script, SHA
+     * divergente ou NOSCRIPT persistente.
      *
      * @param  list<string>  $keys
      * @param  list<int|float|string>  $arguments
      */
-    public function evalScript(string $script, array $keys, array $arguments): mixed
+    public function evalScript(LuaScript $script, array $keys, array $arguments): mixed
     {
-        return $this->run(function () use ($script, $keys, $arguments): mixed {
-            $this->connection->clearLastError();
-
-            $reply = $this->connection->eval($script, [...$keys, ...$arguments], count($keys));
-
-            if ($reply === false) {
-                $serverError = $this->connection->getLastError();
-
-                if ($serverError !== null) {
-                    $this->connection->clearLastError();
-
-                    throw LuaScriptFailureException::serverError($serverError);
-                }
-            }
-
-            return $reply;
-        });
+        return $this->run(fn (): mixed => $this->runEvalShaOnClient(
+            client: $this->connection,
+            script: $script,
+            keys: $keys,
+            arguments: $arguments,
+        ));
     }
 
     /**
