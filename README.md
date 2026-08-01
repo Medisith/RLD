@@ -23,20 +23,15 @@ ser um limite exatamente quando mais importa.
 O naive fica no projeto de propósito, como artefato didático comparativo. Registros completos:
 `docs/fases/fase-1` a `fase-4`.
 
-## Rodar em 3 comandos
+## Rodar sem Docker (caminho padrão)
+
+Docker é **opcional**. Com Redis na máquina (`127.0.0.1:6379`), ignore o Compose.
 
 ```bash
-docker compose up -d      # sobe SÓ o Redis (ou use um Redis local seu)
-./scripts/demo.sh         # roda as três provas e imprime o contraste (Windows: scripts/demo.ps1)
-```
+# Provas (Windows: scripts/demo.ps1 | Linux/macOS: ./scripts/demo.sh)
+./scripts/demo.sh
 
-Tem 5 minutos? O roteiro completo de avaliação está em
-[docs/fases/fase-7-portfolio-closure.md](docs/fases/fase-7-portfolio-closure.md).
-
-A demo não exige `composer install` — o script de prova carrega os mesmos algoritmos do
-middleware por autoloader próprio. Para a aplicação HTTP completa:
-
-```bash
+# App HTTP
 cp .env.example .env && composer install && php artisan key:generate
 php artisan serve --port=8000
 
@@ -44,6 +39,14 @@ curl -i -X POST http://localhost:8000/api/rate-limited/ping -H 'Accept: applicat
 # 200 + X-RateLimit-Limit: 50 | X-RateLimit-Remaining: 49 | X-RateLimit-Reset: 50
 # esgotado o balde: 429 + Retry-After + X-RateLimit-Reset (code RATE_LIMIT_EXCEEDED)
 ```
+
+Sem Redis local, opcional: `docker compose up -d` sobe **só** o Redis; a app segue no host.
+
+Tem 5 minutos? O roteiro completo de avaliação está em
+[docs/fases/fase-7-portfolio-closure.md](docs/fases/fase-7-portfolio-closure.md).
+
+A demo não exige `composer install` — o script de prova carrega os mesmos algoritmos do
+middleware por autoloader próprio.
 
 ## Escolhendo o algoritmo (global e por rota)
 
@@ -85,16 +88,56 @@ O cliente é checado primeiro, de propósito: um cliente abusivo barrado no pró
 drena a cota do tenant. **O header não é fronteira de confiança** — só tem valor se um gateway
 confiável o injeta. Desenho, trade-offs e limites: `docs/fases/fase-9-tenant-quotas-and-runbook.md`.
 
-## Carga (k6)
+**Planos de cota** (Fase 11): tenants diferentes, limites diferentes, sem billing real.
+
+```php
+// config/rate_limiting.php -> tenant
+'default_plan' => 'free',
+'plans' => [
+    'free' => ['capacity' => 60,  'algorithm' => 'token_bucket', 'refill_rate' => 1.0],
+    'pro'  => ['capacity' => 600, 'algorithm' => 'token_bucket', 'refill_rate' => 10.0],
+],
+'assignments' => ['acme' => 'pro'],   // decidido no SERVIDOR, nunca por header
+```
+
+O cliente diz quem é; o servidor decide quanto ele pode — não existe header de plano. A chave do
+balde não inclui o plano, então mudar de plano não zera a cota. Plano inexistente falha alto em
+vez de conceder a cota-base em silêncio. Ver `docs/fases/fase-11-tenant-plans.md`.
+
+```bash
+php artisan rate-limit:dry-run rate-limited.ping --tenant=acme   # plano resolvido + chave
+```
+
+## Carga e concorrência HTTP
+
+**k6 sobre `artisan serve`** (Fase 8) — mede latência e a curva permitidas/negadas vista pelo
+cliente. Números reais medidos: naive 50 allowed / p95 8.53 s, token_bucket 93 / 9.04 s,
+leaky_bucket 92 / 8.61 s em 40 VUs × 200 iterações. Detalhes e leitura em
+`docs/fases/fase-8-k6-load.md`.
 
 ```bash
 k6 run -e ALGORITHM=token_bucket k6/rate_limit_burst.js   # exige app servida + Redis
 ```
 
-Mede latência (p95), vazão e a curva permitidas/negadas vista pelo cliente. Não substitui a
-prova de concorrência: sob `php artisan serve` (single-worker) as requisições são serializadas.
-Roteiro e tabela de resultados reais em `docs/fases/fase-8-k6-load.md` (40 VUs × 200; p95
-dominado pela fila do serve, não pelo Lua).
+**HTTP multi-worker** (Fase 10) — `artisan serve` é single-worker e serializa, então o naive não
+sobre-admite por ali. Servindo com vários workers, ele sobre-admite:
+
+| Algoritmo | Workers | allowed (esperado 50, de 200 requisições) |
+|---|---:|---|
+| naive (controle) | 1 | 50 / 50 / 50 |
+| **naive** | **8** | **60 / 60 / 54** |
+| token_bucket | 8 | 50 / 50 / 50 |
+| leaky_bucket | 8 | 50 / 50 / 50 |
+
+```bash
+# Caminho sem Docker (recomendado neste portfólio): harness + prova HTTP
+./scripts/http_concurrency_compare.sh 8 3 50
+```
+
+Requer **Linux, macOS ou WSL** (`PHP_CLI_SERVER_WORKERS` / fork). No Windows nativo o harness
+multi-worker **não roda** — use WSL com Redis local, ou aceite a evidência já registrada na doc.
+Compose + nginx/php-fpm existe como caminho **opcional** (quando houver Docker); não é
+necessário para fechar a fase. Detalhe em `docs/fases/fase-10-http-concurrency.md`.
 
 ## Operação (Fase 4)
 
@@ -153,19 +196,24 @@ vereditos no log do job.
 
 - **Não é um pacote de produção:** observabilidade é a MÍNIMA (4 contadores + logs
   estruturados — sem série temporal, tracing ou alertas), sem Nginx/edge (fora de escopo).
-- **Carga k6 sob `artisan serve`:** números reais na fase 8; o p95 alto reflete fila
-  single-worker, não custo do limitador. Concorrência de verdade continua nas provas PHP.
-- **Quota por tenant é leve, não multi-tenant de verdade:** um limite igual para todos os
-  tenants, sem planos, hierarquia ou billing; o header `X-Tenant-Id` depende de um gateway
-  confiável para ter qualquer valor de segurança; os dois checks não são atômicos entre si
-  (vazamento de 1 token documentado na fase 9).
+- **A carga multi-worker medida veio do harness, não da stack Laravel completa:** os números da
+  Fase 10 provam a concorrência do algoritmo pelo caminho HTTP, mas não medem middleware,
+  roteamento e boot do framework. Compose + k6 é caminho **opcional** (exige Docker); o
+  portfólio fecha a fase sem ele. No Windows nativo, multi-worker HTTP pede WSL ou fica na
+  evidência documentada.
+- **Quota por tenant é leve, não multi-tenant de verdade:** há planos (free/pro) via mapa em
+  config, mas sem billing, sem cadastro dinâmico, sem hierarquia e sem override por rota; o
+  header `X-Tenant-Id` depende de um gateway confiável para ter qualquer valor de segurança; os
+  dois checks não são atômicos entre si (vazamento de 1 token documentado na fase 9).
+- **Métricas não são série temporal:** 4 contadores acumulativos, sem endpoint Prometheus — a
+  Trilha B da Fase 11 (exposição HTTP das métricas) ficou registrada como candidata futura.
 - **Redis único, sem HA:** cluster/sentinel e as consequências para EVALSHA/TIME não são
   tratados; `failure_mode` cobre indisponibilidade, não split-brain.
 - **Chave por IP atrás de proxy exige `TRUSTED_PROXIES` correto:** o padrão seguro (nenhum
   proxy confiável) vira balde único atrás de LB até você configurar a lista — documentado na
   fase 6; cardinalidade de chaves sob flood distribuído é limitada pelos TTLs, não eliminada.
-- **CI no GitHub Actions:** a suíte e as provas rodam no workflow (`.github/workflows/ci.yml`);
-  localmente `php artisan test` passou com Redis real (54 testes) nesta máquina.
+- **Testes e CI:** a suíte Pest e o workflow no GitHub Actions rodam com Redis real; a mecânica
+  (provas, EVALSHA, NOSCRIPT, anonimização, tenant/planos) tem evidência registrada nas docs.
 - **Feito, apesar do nome "futuro" em fases antigas:** `SCRIPT LOAD`/EVALSHA (Fase 4),
   `X-RateLimit-Reset` (Fase 4), `failure_mode` honrado (Fase 2).
 
@@ -184,7 +232,9 @@ vereditos no log do job.
 | [docs/fases/fase-7-portfolio-closure.md](docs/fases/fase-7-portfolio-closure.md) | CI com Redis service e o roteiro de avaliação em 5 minutos |
 | [docs/fases/fase-8-k6-load.md](docs/fases/fase-8-k6-load.md) | Carga com k6: script, comandos e o que a medição não prova |
 | [docs/fases/fase-9-tenant-quotas-and-runbook.md](docs/fases/fase-9-tenant-quotas-and-runbook.md) | Quota por tenant: desenho, dois checks vs script composto, limites |
-| [docs/runbook.md](docs/runbook.md) | Runbook operacional: Redis fora, spoofing, SCRIPT FLUSH, cliente bloqueado |
+| [docs/fases/fase-10-http-concurrency.md](docs/fases/fase-10-http-concurrency.md) | Multi-worker: topologia escolhida, controle de 1 worker e a tabela real |
+| [docs/fases/fase-11-tenant-plans.md](docs/fases/fase-11-tenant-plans.md) | Planos de cota por tenant: precedência, chave estável, falha alta |
+| [docs/runbook.md](docs/runbook.md) | Runbook operacional: Redis fora, spoofing, SCRIPT FLUSH, cliente bloqueado, planos |
 
 ## Estrutura do domínio
 

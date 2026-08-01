@@ -1,10 +1,15 @@
 # =========================================================================
-# Infra mínima de demonstração — SOMENTE o Redis (Fase 5).
+# Infra OPCIONAL — o caminho padrão do portfólio é Redis + PHP no host,
+# sem Docker (README: "Rodar sem Docker").
 #
-# Decisão explícita: o PHP roda na máquina host (php artisan serve, provas,
-# testes); containerizar a aplicação está fora do escopo do portfólio. Este
-# Compose existe para quem não tem Redis local: `docker compose up -d` e o
-# projeto inteiro funciona com a config padrão (127.0.0.1:6379).
+# PADRÃO deste arquivo (Fase 5) — `docker compose up -d` sobe SOMENTE o
+# Redis, para quem não tem Redis local. O PHP continua no host.
+#
+# PERFIL "http" (Fase 10) — opcional: php-fpm + nginx com vários workers
+# para k6 na stack Laravel. A evidência canônica da fase é o harness
+# (scripts/http_concurrency_compare.sh), que também não usa Docker.
+#
+# Sem `--profile http`, nada além do Redis é iniciado.
 #
 # Sem persistência de propósito (--save "" e appendonly no): estado de rate
 # limiting é efêmero por natureza; um restart do container equivale ao
@@ -22,3 +27,46 @@ services:
       interval: 2s
       timeout: 2s
       retries: 15
+
+  app:
+    profiles: ["http"]
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+    container_name: rate-limiter-app
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      APP_ENV: local
+      APP_DEBUG: "true"
+      # A aplicação fala com o Redis pelo nome do serviço na rede do Compose.
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      # Algoritmo sob teste — troque e reinicie o serviço para comparar:
+      #   docker compose --profile http up -d --force-recreate app
+      RATE_LIMIT_PING_ALGORITHM: "${RATE_LIMIT_PING_ALGORITHM:-token_bucket}"
+      RATE_LIMIT_CAPACITY: "${RATE_LIMIT_CAPACITY:-50}"
+      RATE_LIMIT_REFILL_RATE: "${RATE_LIMIT_REFILL_RATE:-1.0}"
+      RATE_LIMIT_LEAK_RATE: "${RATE_LIMIT_LEAK_RATE:-1.0}"
+      # Nginx é o único proxy à frente da aplicação e está na rede interna
+      # do Compose: confiar nele faz request->ip() devolver o IP real do
+      # cliente de carga em vez do IP do container do nginx (Fase 6).
+      TRUSTED_PROXIES: "*"
+    volumes:
+      # Código-fonte montado para iteração; vendor/ vem da imagem (volume
+      # anônimo) para não ser encoberto pela montagem do host.
+      - .:/var/www/html
+      - /var/www/html/vendor
+
+  web:
+    profiles: ["http"]
+    image: nginx:1.27-alpine
+    container_name: rate-limiter-web
+    depends_on:
+      - app
+    ports:
+      - "8000:80"
+    volumes:
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - .:/var/www/html:ro

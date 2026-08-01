@@ -85,14 +85,45 @@ Reset é seguro por construção: chave ausente é um estado válido para os tr�
 
 ## Incidente 5 — Cota de tenant esgotando cedo demais
 
-1. Confirme a política vigente: `php artisan rate-limit:dry-run rate-limited.ping`.
-2. Verifique se `RATE_LIMIT_TENANT_CAPACITY` e a taxa (`REFILL_RATE`/`LEAK_RATE`) fazem sentido
-   para o número de clientes ativos daquele tenant — a cota é compartilhada, então N clientes
-   consomem N vezes mais rápido.
-3. Lembre do vazamento documentado (Fase 9): quando o tenant nega, o token já consumido do
+1. Confirme o que está valendo para aquele tenant, incluindo o plano resolvido:
+
+   ```bash
+   php artisan rate-limit:dry-run rate-limited.ping --tenant=acme
+   ```
+
+   A saída mostra o plano, a capacidade, a taxa e a chave do balde compartilhado. Use o **mesmo**
+   resolvedor do middleware, então o que aparece aqui é o que acontece em produção.
+
+2. Se o plano vier errado (ex.: um cliente pagante aparecendo como `free`), o problema está no
+   mapa `rate_limiting.tenant.assignments` — corrija e reinicie os workers. Com
+   `php artisan config:cache` ativo, refaça o cache: o mapa é config, não banco.
+
+3. Se o plano estiver certo mas a cota for pequena demais, avalie `capacity` e a taxa do plano em
+   `rate_limiting.tenant.plans` contra o número de clientes ativos daquele tenant — a cota é
+   compartilhada, então N clientes a consomem N vezes mais rápido.
+
+4. Lembre do vazamento documentado (Fase 9): quando o tenant nega, o token já consumido do
    cliente não volta. Sob esgotamento sustentado do tenant, os baldes dos clientes também
    drenam — o que faz o problema parecer maior do que é. Após corrigir a cota, um
    `rate-limit:reset` nas chaves de cliente afetadas acelera a normalização.
+
+5. Erro `unknown tenant plan '<nome>'` nos logs significa `assignments` apontando para um plano
+   que não existe em `plans`. É falha explícita de propósito (Fase 11) — corrigir a config é a
+   única ação; não há fallback silencioso a investigar.
+
+## Incidente 6 — Suspeita de sobre-admissão em produção
+
+Sintoma: o backend recebe mais requisições do que a capacidade configurada.
+
+1. Confirme qual algoritmo está ativo: `php artisan rate-limit:dry-run <rota>`. Se for `naive`,
+   o problema está explicado — ele é didático e sobre-admite sob concorrência **por desenho**
+   (Fases 1 e 10). Troque para `token_bucket` ou `leaky_bucket`.
+2. Se já for um dos atômicos, o excesso não vem do algoritmo. Verifique, nesta ordem: (a)
+   `TRUSTED_PROXIES` — clientes caindo em baldes diferentes por IP mal resolvido inflam o total
+   agregado; (b) mais de uma política/rota atendendo o mesmo caminho; (c) `capacity` real vigente
+   vs a esperada.
+3. Para reproduzir sob concorrência controlada, sem tocar em produção:
+   `./scripts/http_concurrency_compare.sh 8 3 50` (Fase 10).
 
 ## Como inspecionar chaves e métricas
 

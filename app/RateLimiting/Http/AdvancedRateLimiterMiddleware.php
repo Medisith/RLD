@@ -136,7 +136,16 @@ final readonly class AdvancedRateLimiterMiddleware
                     );
 
                 if (! $tenantResult->allowed) {
-                    return $this->denyAndReport($request, $tenantResult, RateLimitScope::Tenant);
+                    return $this->denyAndReport(
+                        $request,
+                        $tenantResult,
+                        RateLimitScope::Tenant,
+                        // Plano no log (Fase 11): sem ele, um 429 de tenant
+                        // não diz se a cota é pequena por plano ou por
+                        // configuração errada. Não vai para o corpo da
+                        // resposta — é informação de operação, não de API.
+                        $tenantQuota->planName,
+                    );
                 }
             }
         } catch (RedisUnavailableException $failure) {
@@ -199,16 +208,21 @@ final readonly class AdvancedRateLimiterMiddleware
     }
 
     /**
-     * Recebe: a requisição, o veredito negado e o escopo do balde que negou.
-     * Faz: contabiliza a negação na métrica e monta a resposta 429.
-     * Retorna: JsonResponse 429. Efeitos colaterais: incremento de métrica
-     * e escrita em log (dentro de deniedResponse).
+     * Recebe: a requisição, o veredito negado, o escopo do balde que negou e
+     * (opcional) o nome do plano do tenant. Faz: contabiliza a negação na
+     * métrica e monta a resposta 429. Retorna: JsonResponse 429. Efeitos
+     * colaterais: incremento de métrica e escrita em log (dentro de
+     * deniedResponse).
      */
-    private function denyAndReport(Request $request, RateLimitResult $result, RateLimitScope $scope): JsonResponse
-    {
+    private function denyAndReport(
+        Request $request,
+        RateLimitResult $result,
+        RateLimitScope $scope,
+        ?string $planName = null,
+    ): JsonResponse {
         $this->metrics->increment(RateLimitMetric::DeniedTotal);
 
-        return $this->deniedResponse($request, $result, $scope);
+        return $this->deniedResponse($request, $result, $scope, $planName);
     }
 
     /**
@@ -252,6 +266,7 @@ final readonly class AdvancedRateLimiterMiddleware
         Request $request,
         RateLimitResult $rateLimitResult,
         RateLimitScope $scope,
+        ?string $planName = null,
     ): JsonResponse {
         Log::info('Request denied by the custom rate limiter.', [
             'key' => $this->keyAnonymizer->anonymize($rateLimitResult->key),
@@ -260,6 +275,7 @@ final readonly class AdvancedRateLimiterMiddleware
             'limit' => $rateLimitResult->limit,
             'retry_after' => $rateLimitResult->retryAfter,
             'reset_after' => $rateLimitResult->resetAfter,
+            ...($planName !== null ? ['plan' => $planName] : []),
             ...$this->requestContext($request),
         ]);
 

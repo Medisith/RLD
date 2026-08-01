@@ -5,11 +5,13 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\RateLimiting\Exceptions\InvalidRateLimitPolicyException;
+use App\RateLimiting\Resolvers\TenantQuotaResolver;
 use App\RateLimiting\Support\AvailableAlgorithm;
 use App\RateLimiting\Support\KeyStrategy;
 use App\RateLimiting\Support\RateLimitPolicy;
 use Illuminate\Console\Command;
 use Illuminate\Contracts\Redis\Factory as RedisFactory;
+use Illuminate\Http\Request;
 use Redis;
 
 /**
@@ -30,7 +32,8 @@ class RateLimitDryRunCommand extends Command
 {
     protected $signature = 'rate-limit:dry-run
         {route : Nome da rota (ex.: rate-limited.ping)}
-        {--identifier=203.0.113.10 : Identificador hipotético do cliente (ip ou id de usuário)}';
+        {--identifier=203.0.113.10 : Identificador hipotético do cliente (ip ou id de usuário)}
+        {--tenant= : Identificador de tenant hipotético, para simular a quota composta}';
 
     protected $description = 'Resolves the effective policy and hypothetical key for a route without consuming budget';
 
@@ -113,10 +116,67 @@ class RateLimitDryRunCommand extends Command
             $this->line('Current state: key absent — client at rest ('.$this->restStateDescription($policy->algorithm).').');
         }
 
+        $this->renderTenantQuota($client, $globalConfig, $policy->name);
+
         $this->newLine();
         $this->info('Dry-run only: no budget was consumed.');
 
         return self::SUCCESS;
+    }
+
+    /**
+     * Recebe: cliente Redis, config global e nome da rota. Faz: quando a
+     * opção --tenant é informada, resolve a quota composta EXATAMENTE como o
+     * middleware faria (mesmo TenantQuotaResolver, mesmo mapa de planos) e
+     * mostra plano, capacidade e chave do balde compartilhado, além do
+     * estado atual. Retorna: void. Efeitos colaterais: leitura no Redis;
+     * config de tenant inválida propaga InvalidRateLimitPolicyException,
+     * capturada pelo chamador.
+     *
+     * @param  array<string, mixed>  $globalConfig
+     */
+    private function renderTenantQuota(Redis $client, array $globalConfig, string $routeName): void
+    {
+        $tenantId = (string) ($this->option('tenant') ?? '');
+
+        if ($tenantId === '') {
+            return;
+        }
+
+        $this->newLine();
+
+        if (! (bool) data_get($globalConfig, 'tenant.enabled', false)) {
+            $this->warn('Tenant quota is DISABLED (rate_limiting.tenant.enabled = false) — the header would be ignored.');
+
+            return;
+        }
+
+        // Requisição sintética só para carregar o header: o resolver lê o
+        // tenant da requisição, e reusá-lo garante que o dry-run e o
+        // middleware nunca divirjam na resolução de plano.
+        $syntheticRequest = Request::create('/', 'POST', server: [
+            'HTTP_'.str_replace('-', '_', strtoupper((string) data_get($globalConfig, 'tenant.header', 'X-Tenant-Id'))) => $tenantId,
+        ]);
+
+        $tenantQuota = app(TenantQuotaResolver::class)->resolve($syntheticRequest, $routeName);
+
+        if ($tenantQuota === null) {
+            $this->warn("Tenant identifier '{$tenantId}' was rejected by sanitization — no tenant quota would apply.");
+
+            return;
+        }
+
+        $this->line('Tenant quota (second check, after the client bucket):');
+        $this->table(['Field', 'Value'], [
+            ['tenant id', $tenantQuota->tenantId],
+            ['resolved plan', $tenantQuota->planName],
+            ['algorithm', $tenantQuota->policy->algorithm->value],
+            ['capacity', (string) $tenantQuota->policy->capacity],
+            ['refill_rate', $tenantQuota->policy->refillRate === null ? '—' : (string) $tenantQuota->policy->refillRate],
+            ['leak_rate', $tenantQuota->policy->leakRate === null ? '—' : (string) $tenantQuota->policy->leakRate],
+            ['tenant key', $tenantQuota->key],
+            ['key exists now', (bool) $client->exists($tenantQuota->key) ? 'yes' : 'no'],
+        ]);
     }
 
     /**
