@@ -90,16 +90,50 @@ return [
     // rate-limit:tenant:{tenantId}:{routeName}. A ordem é CLIENTE-primeiro
     // (justificativa em docs/fases/fase-9-tenant-quotas-and-runbook.md).
     // Os campos abaixo são mesclados sobre a config global (mesma regra
-    // das políticas por rota); limites por tenant INDIVIDUAL (planos) e
-    // overrides por rota ficam fora do escopo desta fase.
+    // das políticas por rota). Planos por tenant (Fase 11) ficam em
+    // 'plans' / 'assignments'; overrides por rota de tenant ficam fora.
     // ------------------------------------------------------------------
     'tenant' => [
         'enabled' => (bool) env('RATE_LIMIT_TENANT_ENABLED', false),
         'header' => env('RATE_LIMIT_TENANT_HEADER', 'X-Tenant-Id'),
+
+        // Valores-base do balde de tenant. Um plano (abaixo) sobrescreve o
+        // que quiser destes campos; o que ele omitir é herdado daqui.
         'capacity' => (int) env('RATE_LIMIT_TENANT_CAPACITY', 200),
         'algorithm' => env('RATE_LIMIT_TENANT_ALGORITHM', 'token_bucket'),
         'refill_rate' => (float) env('RATE_LIMIT_TENANT_REFILL_RATE', 4.0),
         'leak_rate' => (float) env('RATE_LIMIT_TENANT_LEAK_RATE', 4.0),
+
+        // ------------------------------------------------------------------
+        // Planos de cota (Fase 11) — sem billing real.
+        //
+        // O plano é resolvido SEMPRE no servidor: 'assignments' mapeia
+        // tenantId -> nome do plano. O cliente NUNCA escolhe o próprio plano
+        // (não há header de plano, de propósito) — ele apenas se identifica,
+        // e mesmo essa identificação depende de um gateway confiável.
+        // Tenant sem atribuição cai em 'default_plan'.
+        // ------------------------------------------------------------------
+        'default_plan' => env('RATE_LIMIT_TENANT_DEFAULT_PLAN', 'free'),
+
+        'plans' => [
+            'free' => [
+                'capacity' => 60,
+                'algorithm' => 'token_bucket',
+                'refill_rate' => 1.0,
+            ],
+            'pro' => [
+                'capacity' => 600,
+                'algorithm' => 'token_bucket',
+                'refill_rate' => 10.0,
+            ],
+        ],
+
+        // Mapa estático tenantId -> plano. Um cadastro real (banco, painel de
+        // billing) substituiria este array sem mudar o resto do desenho:
+        // basta outra fonte alimentar a mesma resolução.
+        'assignments' => [
+            // 'acme' => 'pro',
+        ],
     ],
 
 ];

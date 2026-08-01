@@ -16,12 +16,14 @@ namespace App\RateLimiting\Support;
 final readonly class TenantQuota
 {
     /**
-     * Recebe: identificador do tenant já sanitizado, a política do balde do
-     * tenant e a chave canônica correspondente. Faz: apenas transporta.
-     * Retorna: instância imutável. Efeitos colaterais: nenhum.
+     * Recebe: identificador do tenant já sanitizado, o nome do plano
+     * resolvido no servidor (Fase 11), a política do balde do tenant e a
+     * chave canônica correspondente. Faz: apenas transporta. Retorna:
+     * instância imutável. Efeitos colaterais: nenhum.
      */
     public function __construct(
         public string $tenantId,
+        public string $planName,
         public RateLimitPolicy $policy,
         public string $key,
     ) {

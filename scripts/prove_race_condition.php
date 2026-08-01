@@ -198,6 +198,27 @@ function printReport(AvailableAlgorithm $algorithm, array $rows): void
 }
 
 /**
+ * Recebe: lista de durações em segundos. Faz: calcula o percentil 95 pelo
+ * método do índice mais próximo (sem interpolação — simples e suficiente
+ * para o volume destas baterias). Retorna: o p95 em segundos, ou 0.0 para
+ * lista vazia. Efeitos colaterais: nenhum.
+ *
+ * @param  list<float>  $durationsSeconds
+ */
+function percentile95(array $durationsSeconds): float
+{
+    if ($durationsSeconds === []) {
+        return 0.0;
+    }
+
+    sort($durationsSeconds);
+
+    $index = (int) ceil(0.95 * count($durationsSeconds)) - 1;
+
+    return $durationsSeconds[max(0, $index)];
+}
+
+/**
  * Recebe: algoritmo escolhido, cliente Redis nativo e parâmetros de taxa.
  * Faz: instancia a MESMA implementação usada pelo middleware em produção.
  * Retorna: RateLimitAlgorithm pronto. Efeitos colaterais: token/leaky leem
@@ -409,6 +430,9 @@ if ($mode === 'http') {
         $obtainedAllowed = 0;
         $denied = 0;
         $transportFailures = 0;
+        // Latências individuais (Fase 10): permitem reportar p95 e vazão sem
+        // depender do k6, para quem roda a comparação só com PHP.
+        $durationsSeconds = [];
 
         foreach ($handles as $handle) {
             $status = (int) curl_getinfo($handle, CURLINFO_RESPONSE_CODE);
@@ -417,6 +441,11 @@ if ($mode === 'http') {
                 $status === 429 => $denied++,
                 default => $transportFailures++,
             };
+
+            if ($status === 200 || $status === 429) {
+                $durationsSeconds[] = (float) curl_getinfo($handle, CURLINFO_TOTAL_TIME);
+            }
+
             curl_multi_remove_handle($multi, $handle);
             curl_close($handle);
         }
@@ -430,13 +459,15 @@ if ($mode === 'http') {
         }
 
         echo sprintf(
-            "round %d: expected=%d, obtained(200)=%d, denied(429)=%d, transport failures=%d, duration=%.3fs\n",
+            "round %d: expected=%d, obtained(200)=%d, denied(429)=%d, transport failures=%d, duration=%.3fs, p95=%.3fs, throughput=%.1f req/s\n",
             $round,
             $expectedAllowed,
             $obtainedAllowed,
             $denied,
             $transportFailures,
             $roundElapsedSeconds,
+            percentile95($durationsSeconds),
+            $roundElapsedSeconds > 0 ? count($durationsSeconds) / $roundElapsedSeconds : 0.0,
         );
 
         $reportRows[] = [

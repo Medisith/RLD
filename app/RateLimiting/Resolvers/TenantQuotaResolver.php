@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\RateLimiting\Resolvers;
 
+use App\RateLimiting\Exceptions\InvalidRateLimitPolicyException;
 use App\RateLimiting\Support\RateLimitPolicy;
 use App\RateLimiting\Support\TenantQuota;
 use Illuminate\Http\Request;
@@ -26,6 +27,12 @@ use Illuminate\Http\Request;
  * próprio middleware de autenticação a partir do token. Este resolver
  * sanitiza o formato, o que evita poluição de keyspace, mas NÃO transforma
  * o header em fronteira de confiança.
+ *
+ * Planos (Fase 11): o cliente diz QUEM é; o servidor decide QUANTO ele pode.
+ * O plano nunca vem de header — sai do mapa estático
+ * rate_limiting.tenant.assignments, com queda para default_plan. Assim,
+ * forjar o header no máximo troca o balde por outro de um tenant existente;
+ * jamais concede uma cota maior por conta própria.
  */
 final readonly class TenantQuotaResolver
 {
@@ -80,20 +87,84 @@ final readonly class TenantQuotaResolver
             return null;
         }
 
+        // Plano resolvido SEMPRE no servidor (Fase 11): o cliente identifica
+        // quem é, nunca quanto pode. Sem atribuição explícita, cai no plano
+        // padrão.
+        $planName = $this->planFor($rawTenantId, $tenantConfig);
+        $planConfig = $this->planConfig($planName, $tenantConfig);
+
         // A política do tenant reaproveita TODA a validação de invariantes
         // do RateLimitPolicy (capacidade, taxas por algoritmo, custo).
+        // Precedência: plano > base do tenant > config global.
         // key_strategy é herdada da config global e ignorada aqui: a chave
         // do tenant não depende de estratégia de identificação de cliente.
         $policy = RateLimitPolicy::fromConfig(
-            name: 'tenant:'.$routeName,
-            routeConfig: $tenantConfig,
+            name: sprintf('tenant:%s:%s', $planName, $routeName),
+            routeConfig: array_merge($tenantConfig, $planConfig),
             globalConfig: $this->globalConfig,
         );
 
         return new TenantQuota(
             tenantId: $rawTenantId,
+            planName: $planName,
             policy: $policy,
+            // A chave NÃO inclui o plano de propósito: a identidade do balde
+            // é o tenant. Trocar de plano ajusta capacidade e taxa sem dar ao
+            // tenant um balde novo e zerado — do contrário, uma mudança de
+            // plano no meio da janela seria um reset gratuito de cota.
             key: sprintf('%s:tenant:%s:%s', $this->keyPrefix, $rawTenantId, $routeName),
         );
+    }
+
+    /**
+     * Recebe: o identificador do tenant e a configuração de tenant. Faz:
+     * consulta o mapa estático de atribuições e cai no plano padrão quando
+     * o tenant não tem atribuição própria. Retorna: nome do plano. Efeitos
+     * colaterais: nenhum.
+     *
+     * @param  array<string, mixed>  $tenantConfig
+     */
+    private function planFor(string $tenantId, array $tenantConfig): string
+    {
+        /** @var array<string, string> $assignments */
+        $assignments = (array) ($tenantConfig['assignments'] ?? []);
+
+        $assignedPlan = $assignments[$tenantId] ?? null;
+
+        return is_string($assignedPlan) && $assignedPlan !== ''
+            ? $assignedPlan
+            : (string) ($tenantConfig['default_plan'] ?? '');
+    }
+
+    /**
+     * Recebe: nome do plano e a configuração de tenant. Faz: localiza os
+     * parâmetros do plano. Retorna: array de configuração do plano — vazio
+     * quando não há planos declarados (retrocompatível com a Fase 9, em que
+     * a cota do tenant era única). Efeitos colaterais: nenhum; lança
+     * InvalidRateLimitPolicyException quando existem planos declarados mas o
+     * nome resolvido não está entre eles: erro de configuração falha alto em
+     * vez de silenciosamente conceder a cota-base a um tenant.
+     *
+     * @param  array<string, mixed>  $tenantConfig
+     * @return array<string, mixed>
+     */
+    private function planConfig(string $planName, array $tenantConfig): array
+    {
+        /** @var array<string, array<string, mixed>> $plans */
+        $plans = (array) ($tenantConfig['plans'] ?? []);
+
+        if ($plans === []) {
+            return [];
+        }
+
+        if (! isset($plans[$planName])) {
+            throw InvalidRateLimitPolicyException::forReason(sprintf(
+                "unknown tenant plan '%s' — declared plans: %s",
+                $planName,
+                implode(', ', array_keys($plans)),
+            ));
+        }
+
+        return (array) $plans[$planName];
     }
 }
